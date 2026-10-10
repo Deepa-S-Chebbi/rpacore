@@ -22,6 +22,8 @@ def screenshot_html(path: object) -> str:
         and not normalized.startswith("//")
     ):
         try:
+            # 3.14 as_uri() percent-encodes lone surrogates; strict UTF-8 keeps them text.
+            path.encode("utf-8")
             if re.match(r"^[A-Za-z]:[/\\]", path):
                 target = PureWindowsPath(path).as_uri()
             elif not re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", path):
