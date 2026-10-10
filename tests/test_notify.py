@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import ssl
 from datetime import datetime, timezone
 from email import message_from_string
@@ -11,6 +12,7 @@ from html.parser import HTMLParser
 from io import BytesIO, StringIO
 from pathlib import PureWindowsPath
 from unittest.mock import MagicMock, patch
+from urllib.parse import quote
 
 import pytest
 
@@ -444,7 +446,13 @@ class TestEmailNotifierSend:
 
         links: list[dict[str, str]] = []
         Links().feed(html_part.get_payload(decode=True).decode("utf-8"))
-        assert links == [{"href": PureWindowsPath(img).as_uri()}]
+        # Drive paths become file:/// targets; single-root POSIX paths stay absolute.
+        expected_href = (
+            PureWindowsPath(img).as_uri()
+            if os.name == "nt"
+            else quote(str(img), safe="/")
+        )
+        assert links == [{"href": expected_href}]
 
     def test_attachment_filename_not_double_quoted(self, tmp_path):
         """Content-Disposition filename must not contain embedded quotes."""
