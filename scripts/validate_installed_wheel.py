@@ -116,6 +116,7 @@ def _remove_tree(path: Path) -> None:
 def _smoke_code(repo_root: Path) -> str:
     return f"""
 from pathlib import Path
+from html.parser import HTMLParser
 import io
 import importlib
 import json
@@ -136,11 +137,13 @@ from rpacore import (
     RetryDisposition,
     Step,
     Status,
+    SystemException,
     Transaction,
     generate_report,
     query_transactions,
     save_transaction,
     serialize_transaction,
+    render_html,
     render_json,
     validate_config,
 )
@@ -216,6 +219,35 @@ default_report = generate_report(Transaction(reference="default-outcome-smoke"))
 assert default_report.outcome.category is OutcomeCategory.UNKNOWN
 assert default_report.outcome.retry_disposition is RetryDisposition.UNKNOWN
 assert default_report.outcome.failure_code == ""
+
+class ScreenshotLinks(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.targets = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            self.targets.extend(value for key, value in attrs if key == "href")
+
+for path, target in (
+    ("javascript:alert(1)", None),
+    ("data:text/html,<script>x</script>", None),
+    ("//host/shot.png", None),
+    ("shot" + chr(0xDCFF) + ".png", None),
+    ("err.png", "err.png"),
+    ("shots/a #?%.png", "shots/a%20%23%3F%25.png"),
+    ("C:/shots/err.png", "file:///C:/shots/err.png"),
+):
+    step = Step("screenshot-link-probe", 1)
+    step.exceptions = [SystemException("synthetic", screenshot_path=path)]
+    screenshot_report = generate_report(Transaction(reference="link-probe", steps=[step]))
+    json_before = render_json(screenshot_report)
+    links = ScreenshotLinks()
+    links.feed(render_html(screenshot_report))
+    assert links.targets == ([] if target is None else [target])
+    assert render_json(screenshot_report) == json_before
+print("Installed screenshot-link policy passed")
+
 assert validate_config(
     {{}},
     (ConfigField("retry_count", int, required=False, default=0, min_value=0),),

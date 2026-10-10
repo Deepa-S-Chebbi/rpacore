@@ -82,6 +82,15 @@ RPA Core records artifact metadata and file paths; it does not read, hash,
 upload, validate, scan, or execute artifact contents. An artifact record is audit
 metadata, not proof that a file is safe, unchanged, or still present.
 
+HTML reports and email HTML link only unambiguous local screenshot paths, as
+described in the [API reference](api.md). Stored URL schemes, network-share or
+ambiguous paths, control characters, and padded values render as escaped text.
+This intentionally restricts previously clickable values without altering the
+original diagnostic records. Link rendering performs no file or network I/O;
+it does not attest file contents or guarantee that an email client can open
+the target. Relative links may include `../`; this policy is not a filesystem
+sandbox. SMTP attachment handling remains separate and unchanged.
+
 Path helpers normalize paths and can enforce allowed roots where documented, but
 they are not a general-purpose filesystem sandbox. Treat symlinks, shared
 directories, inherited permissions, and local multi-user machines as part of the

@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
+from rpacore._report_links import screenshot_html
 from rpacore.exceptions import BusinessException, SystemException
 from rpacore.outcome import OutcomeCategory, RetryDisposition
 from rpacore.serialization import serialize_transaction
@@ -598,12 +599,6 @@ def render_html(report: TransactionReport) -> str:
             action_html = (
                 f" &mdash; action: {_esc(str(exc['action']))}" if exc["action"] else ""
             )
-            screenshot_path = exc.get("screenshot_path")
-            screenshot_html = (
-                f'<br><a href="{_esc(screenshot_path)}">screenshot</a>'
-                if isinstance(screenshot_path, str) and screenshot_path
-                else ""
-            )
             exc_parts.append(
                 _EXC_TEMPLATE.substitute(
                     exc_class=exc_class,
@@ -611,7 +606,7 @@ def render_html(report: TransactionReport) -> str:
                     retry_number=f"{exc['retry_number']}{halt_html}",
                     message=_esc(str(exc["message"])),
                     action_html=action_html,
-                    screenshot_html=screenshot_html,
+                    screenshot_html=screenshot_html(exc.get("screenshot_path")),
                 )
             )
         status = str(step["status"])

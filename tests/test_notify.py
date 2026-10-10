@@ -6,7 +6,10 @@ import json
 import logging
 import ssl
 from datetime import datetime, timezone
+from email import message_from_string
+from html.parser import HTMLParser
 from io import BytesIO, StringIO
+from pathlib import PureWindowsPath
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -262,6 +265,34 @@ class TestEmailNotifierConfig:
 # ---------------------------------------------------------------------------
 
 class TestEmailNotifierSend:
+    def test_email_html_uses_safe_screenshot_links(self):
+        report = _make_report()
+        report.steps = [StepReport(
+            name="synthetic", execution_order=1, status=Status.FAILED, icon="x",
+            exceptions=[
+                SystemException("unsafe", screenshot_path="javascript:alert(1)"),
+                BusinessException("local", screenshot_path="shots/err.png"),
+            ],
+        )]
+        with patch("rpacore.notify.smtplib.SMTP") as smtp_cls:
+            EmailNotifier(_email_config(), _creds("synthetic")).send(report)
+        smtp = smtp_cls.return_value.__enter__.return_value
+        message = message_from_string(smtp.sendmail.call_args.args[2])
+        html_part = next(part for part in message.walk() if part.get_content_type() == "text/html")
+        text_part = next(part for part in message.walk() if part.get_content_type() == "text/plain")
+
+        class Links(HTMLParser):
+            def handle_starttag(self, tag, attrs):
+                if tag == "a":
+                    links.append(dict(attrs))
+
+        links = []
+        html_body = html_part.get_payload(decode=True).decode("utf-8")
+        Links().feed(html_body)
+        assert links == [{"href": "shots/err.png"}]
+        assert "javascript:alert(1)" in html_body
+        assert "javascript:alert(1)" in text_part.get_payload(decode=True).decode("utf-8")
+
     def _send(self, report: TransactionReport | None = None, password: str = "pw") -> MagicMock:
         """Call send() with a mocked SMTP and return the mock instance."""
         notifier = EmailNotifier(_email_config(), _creds(password))
@@ -395,7 +426,25 @@ class TestEmailNotifierSend:
             mock_smtp_cls.return_value.__exit__ = MagicMock(return_value=False)
             notifier.send(report)
         _, _, raw_msg = mock_smtp.sendmail.call_args.args
-        assert b"PNG" in raw_msg.encode() or "shot.png" in raw_msg
+        message = message_from_string(raw_msg)
+        attachments = [
+            part for part in message.walk()
+            if part.get_content_disposition() == "attachment"
+        ]
+        assert [part.get_filename() for part in attachments] == ["shot.png"]
+        assert attachments[0].get_payload(decode=True) == b"PNG"
+        html_part = next(
+            part for part in message.walk() if part.get_content_type() == "text/html"
+        )
+
+        class Links(HTMLParser):
+            def handle_starttag(self, tag, attrs):
+                if tag == "a":
+                    links.append(dict(attrs))
+
+        links: list[dict[str, str]] = []
+        Links().feed(html_part.get_payload(decode=True).decode("utf-8"))
+        assert links == [{"href": PureWindowsPath(img).as_uri()}]
 
     def test_attachment_filename_not_double_quoted(self, tmp_path):
         """Content-Disposition filename must not contain embedded quotes."""
@@ -493,7 +542,10 @@ class TestEmailNotifierSend:
             mock_smtp_cls.return_value.__exit__ = MagicMock(return_value=False)
             notifier.send(report)
         _, _, raw_msg = mock_smtp.sendmail.call_args.args
-        assert "shot.png" not in raw_msg
+        message = message_from_string(raw_msg)
+        assert not any(
+            part.get_content_disposition() == "attachment" for part in message.walk()
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -163,6 +163,18 @@ serialization or record encoding cannot complete, it remains renderable with
 `complete: false`, a stable `rpacore.report.*` error code, and only the
 available transaction header; it never changes the transaction outcome.
 
+`render_html()` links only unambiguous local screenshot paths: relative paths
+(including `./` and `../`), single-root POSIX paths, and fully qualified Windows
+drive paths. Relative backslashes become separators; Windows drive paths become
+local `file:///` targets. Filename spaces and URL delimiters are percent-encoded.
+Explicit URLs (including `file:`), UNC/device paths, drive-relative or
+drive-root-relative paths, authority-style prefixes, control characters, and
+leading/trailing whitespace render as escaped text. Paths that cannot be
+encoded as Unicode URL targets also remain text. Empty paths add no link.
+Rendering does not check file existence or resolve paths against the working
+directory; relative links use the report location as their base. Original
+values remain intact in report JSON, text, and persisted exceptions.
+
 `WebhookNotifier` preserves its existing payload by default. Set
 `notification.webhook.include_report = true` to add a `report` member
 containing report format v2. This is opt-in because reports include existing

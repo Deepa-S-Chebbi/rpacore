@@ -5,6 +5,8 @@ from __future__ import annotations
 import dataclasses
 import json
 from datetime import datetime, timedelta, timezone
+from html.parser import HTMLParser
+from pathlib import Path
 
 import pytest
 
@@ -66,6 +68,104 @@ def make_transaction(
     tx.status = status
     tx.steps = steps or []
     return tx
+
+
+class ReportHTML(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.links = []
+        self.text = []
+        self.tags = []
+
+    def handle_starttag(self, tag, attrs):
+        self.tags.append(tag)
+        if tag == "a":
+            self.links.append(dict(attrs))
+
+    def handle_data(self, data):
+        self.text.append(data)
+
+
+@pytest.mark.parametrize("exception_type", [BusinessException, SystemException])
+@pytest.mark.parametrize("path", [
+    "javascript:alert(1)", "JaVaScRiPt:alert(1)", "data:text/html,<script>x</script>",
+    "vbscript:msgbox(1)", "https://example.com/shot.png", "http://example.com/x",
+    "custom:shot.png", "mailto:x@example.com", "file:///tmp/shot.png", "FILE:///C:/shot.png",
+    "file://host/shot.png", "java\nscript:alert(1)", "java\tscript:alert(1)",
+    "java\rscript:alert(1)", "\x00javascript:alert(1)", "shot\x7f.png", "shot\x1f.png",
+    " javascript:alert(1)", "err.png ", "\terr.png", "\u00a0err.png",
+    "C:shot.png", r"\shot.png", "//host/shot.png", r"\\host\shot.png",
+    r"/\host/shot.png", r"\/host/shot.png", r"\\?\C:\shot.png", r"\\.\device",
+    "shot\udcff.png", "C:/shot\udcff.png",
+    'javascript:alert(1)\"><script>x</script><a href="x',
+])
+def test_unsafe_screenshot_paths_are_visible_without_links(exception_type, path):
+    step = make_step("unsafe", 1, Status.FAILED)
+    step.exceptions = [exception_type("synthetic", screenshot_path=path)]
+    parsed = ReportHTML()
+    parsed.feed(render_html(generate_report(make_transaction(steps=[step]))))
+
+    assert parsed.links == []
+    assert path in "".join(parsed.text)
+    assert "script" not in parsed.tags
+
+
+@pytest.mark.parametrize(("path", "target"), [
+    ("err.png", "err.png"), ("./shots/err.png", "./shots/err.png"),
+    ("../shots/err.png", "../shots/err.png"), (r"shots\err.png", "shots/err.png"),
+    ("/tmp/err.png", "/tmp/err.png"),
+    (r"C:\shots\err.png", "file:///C:/shots/err.png"),
+    ("C:/shots/err.png", "file:///C:/shots/err.png"),
+    ("z:/shots/a #?%.png", "file:///z:/shots/a%20%23%3F%25.png"),
+    ('shots/a #?%&\"<>\'.png', "shots/a%20%23%3F%25%26%22%3C%3E%27.png"),
+    ("shots/a:b.png", "shots/a%3Ab.png"),
+    ("shots/ação.png", "shots/a%C3%A7%C3%A3o.png"),
+    ("", None),
+])
+def test_local_screenshot_paths_have_exact_targets(path, target):
+    step = make_step("local", 1)
+    step.exceptions = [sys_("synthetic", screenshot=path)]
+    html = render_html(generate_report(make_transaction(steps=[step])))
+    parsed = ReportHTML()
+    parsed.feed(html)
+
+    assert parsed.links == ([] if target is None else [{"href": target}])
+    assert "script" not in parsed.tags
+    if target is None:
+        assert "screenshot" not in html
+
+
+def test_loaded_screenshot_rendering_preserves_evidence_without_io(tmp_path, monkeypatch):
+    step = make_step("persisted", 1, Status.FAILED)
+    paths = ["javascript:alert(1)", "err.png", "data:text/html,<script>x</script>"]
+    step.exceptions = [
+        biz("first", screenshot=paths[0]), sys_("retry", retry=1, screenshot=paths[1]),
+        sys_("last", retry=2, screenshot=paths[2]),
+    ]
+    tx = make_transaction(steps=[step])
+    tx.definition_identity = "report-link-test/v1"
+    db = str(tmp_path / "report.db")
+    save_transaction(tx, db)
+    loaded = load_transaction(tx.id, db)
+    report = generate_report(loaded)
+    json_before, text_before = render_json(report), render_text(report)
+
+    def unexpected_io(*args, **kwargs):
+        pytest.fail("HTML rendering performed I/O")
+
+    with monkeypatch.context() as guard:
+        guard.setattr("builtins.open", unexpected_io)
+        guard.setattr(Path, "exists", unexpected_io)
+        guard.setattr(Path, "resolve", unexpected_io)
+        guard.setattr("socket.socket", unexpected_io)
+        parsed = ReportHTML()
+        parsed.feed(render_html(report))
+
+    assert parsed.links == [{"href": "err.png"}]
+    assert paths[0] in "".join(parsed.text) and paths[2] in "".join(parsed.text)
+    assert [exc.screenshot_path for exc in loaded.steps[0].exceptions] == paths
+    assert render_json(report) == json_before
+    assert render_text(report) == text_before
 
 
 # ---------------------------------------------------------------------------

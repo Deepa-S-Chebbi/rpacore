@@ -2,6 +2,16 @@
 
 All notable user-facing changes are recorded here.
 
+## Unreleased
+
+### Fixed
+
+- HTML reports and email HTML now render unsafe or ambiguous screenshot paths
+  as escaped text. Local screenshot paths remain clickable, with Windows drive
+  paths converted to local file URLs and filename delimiters encoded. Explicit
+  URLs, UNC/device paths, control characters, and padded values are no longer
+  links. Persisted screenshot values, report JSON, and text are unchanged.
+
 ## v0.3.0 - 2026-09-03
 
 ### Added
