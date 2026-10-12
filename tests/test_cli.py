@@ -8,8 +8,11 @@ import sqlite3
 import subprocess
 import sys
 import textwrap
+import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
+
+import pytest
 
 import rpacore.cli as cli_module
 from rpacore.doctor import collect_doctor_result
@@ -217,6 +220,40 @@ class TestCliRun:
 
 
 class TestCliInit:
+    @pytest.mark.parametrize("name", [
+        "my project", ".demo", "demo.", "_demo", "demo_", "-demo", "demo-",
+        'my"project', "my'project", "démø", "Kelvin", "demo\n", "demo\t", "demo\x01",
+    ])
+    def test_init_invalid_name_does_not_create_parents(self, tmp_path: Path, name: str) -> None:
+        parent = tmp_path / "missing" / "nested"
+
+        result = run_cli("init", str(parent / name), cwd=tmp_path)
+
+        assert result.returncode == 2
+        assert result.stdout == ""
+        assert "project basename" in result.stderr
+        assert "my-project" in result.stderr
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.parametrize("target", ["", ".", "..", "missing/.."])
+    def test_init_directory_references_are_usage_errors(self, tmp_path: Path, target: str) -> None:
+        result = run_cli("init", target, cwd=tmp_path)
+
+        assert result.returncode == 2
+        assert result.stdout == ""
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.parametrize("name", ["a", "1", "Demo.Project-1", "demo_project", "demo-project", "a..__--b"])
+    def test_init_preserves_valid_name_with_spaces_in_parent(self, tmp_path: Path, name: str) -> None:
+        project = tmp_path / "parent with spaces" / "nested" / name
+
+        result = run_cli("init", str(project), cwd=tmp_path)
+
+        assert result.returncode == 0, result.stderr
+        assert result.stderr == ""
+        metadata = tomllib.loads((project / "pyproject.toml").read_text(encoding="utf-8"))
+        assert metadata["project"]["name"] == name
+
     def test_init_creates_project_that_runs_without_edits(self, tmp_path: Path) -> None:
         result = run_cli("init", "demo_project", cwd=tmp_path)
 
@@ -287,6 +324,22 @@ class TestCliInit:
 
         assert result.returncode == 2
         assert "Project path already exists" in result.stderr
+
+    def test_init_invalid_name_precedes_existing_path_error(self, tmp_path: Path) -> None:
+        project = tmp_path / "my project"
+        project.mkdir()
+        existing_file = project / "keep.txt"
+        existing_file.write_text("preserve me", encoding="utf-8")
+
+        result = run_cli("init", str(project), cwd=tmp_path)
+
+        assert result.returncode == 2
+        assert result.stdout == ""
+        assert "Invalid project basename" in result.stderr
+        assert "Project path already exists" not in result.stderr
+        assert list(tmp_path.iterdir()) == [project]
+        assert list(project.iterdir()) == [existing_file]
+        assert existing_file.read_text(encoding="utf-8") == "preserve me"
 
     def test_init_write_failure_exits_one_and_reports_cleanup(
         self,

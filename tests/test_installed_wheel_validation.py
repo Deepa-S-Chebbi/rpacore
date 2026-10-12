@@ -105,14 +105,17 @@ class TestInstalledWheelValidationScript:
         assert "transition_sink=transitions.append" in code
         assert "ctx.state" in code
 
-    def test_run_prints_command_and_checks_result(self, tmp_path: Path, capsys) -> None:
+    def test_run_prints_command_and_clears_pythonpath(self, tmp_path: Path, capsys, monkeypatch) -> None:
         module = _load_script()
         command = ["python", "--version"]
+        monkeypatch.setenv("PYTHONPATH", "untrusted-checkout")
+        expected_env = os.environ.copy()
+        expected_env.pop("PYTHONPATH")
 
         with patch.object(module.subprocess, "run") as run:
             module._run(command, cwd=tmp_path, allowed_roots=(tmp_path,))
 
-        run.assert_called_once_with(command, cwd=tmp_path, check=True)
+        run.assert_called_once_with(command, cwd=tmp_path, env=expected_env, check=True)
         assert capsys.readouterr().out.strip() == "+ python --version"
 
     def test_run_rejects_cwd_outside_allowed_roots(self, tmp_path: Path) -> None:
@@ -211,22 +214,26 @@ class TestInstalledWheelValidationScript:
                         examples_pytest=[],
                     )
 
-        assert len(calls) == 13
+        assert len(calls) == 14
         assert calls[0][0][1:3] == ["-m", "build"]
         assert calls[1][0][1:3] == ["-m", "venv"]
         assert calls[2][0][1:4] == ["-m", "pip", "install"]
         assert calls[3][0][1] == "-c"
-        assert calls[4][0][-2:] == ["install", "mypy==2.1.0"]
+        assert calls[2][0][-3:] == ["--no-index", "--no-deps", str(work_dir / "wheelhouse" / "rpacore-0.1.0-py3-none-any.whl")]
+        assert calls[4][0][3:] == ["install", "mypy==2.1.0", "build>=1.0", "setuptools>=77.0.0", "wheel>=0.46.2", "pytest>=8.1.1"]
         assert calls[5][0][1:4] == ["-m", "mypy", "--no-incremental"]
         assert calls[6][0][-1] == "version"
-        assert calls[7][0][-2:] == ["init", "installed_project"]
-        assert calls[8][0][1] == "-c"
-        assert "steps/greeting.py" in calls[8][0][2]
-        assert calls[9][0][-1] == "run"
-        assert calls[9][1] == work_dir / "outside" / "installed_project"
-        assert calls[10][0][-2:] == ["transaction", "list"]
-        assert calls[11][0][-3:] == ["transaction", "list", "--json"]
-        assert calls[12][0][-2:] == ["doctor", "--json"]
+        assert calls[7][0][1:] == ["-c", module._scaffold_smoke_code()]
+        assert calls[7][0][2].isascii()  # Printable on legacy Windows consoles.
+        compile(calls[7][0][2], "<installed-scaffold-smoke>", "exec")
+        assert calls[8][0][-2:] == ["init", "installed_project"]
+        assert calls[9][0][1] == "-c"
+        assert "steps/greeting.py" in calls[9][0][2]
+        assert calls[10][0][-1] == "run"
+        assert calls[10][1] == work_dir / "outside" / "installed_project"
+        assert calls[11][0][-2:] == ["transaction", "list"]
+        assert calls[12][0][-3:] == ["transaction", "list", "--json"]
+        assert calls[13][0][-2:] == ["doctor", "--json"]
 
     def test_validate_installed_wheel_uses_prebuilt_wheel_dir(self, tmp_path: Path) -> None:
         module = _load_script()
@@ -253,12 +260,14 @@ class TestInstalledWheelValidationScript:
                         examples_pytest=[],
                     )
 
-        assert len(calls) == 12
+        assert len(calls) == 13
         assert all(command[1:3] != ["-m", "build"] for command, _cwd in calls)
         assert calls[0][0][1:3] == ["-m", "venv"]
         assert calls[1][0][1:4] == ["-m", "pip", "install"]
         assert calls[1][0][-1] == str(wheel)
-        assert calls[3][0][-2:] == ["install", "mypy==2.1.0"]
+        assert "mypy==2.1.0" in calls[3][0]
+        assert "build>=1.0" in calls[3][0]
+        assert "pytest>=8.1.1" in calls[3][0]
         assert calls[4][0][1:4] == ["-m", "mypy", "--no-incremental"]
         assert calls[-1][0][-2:] == ["doctor", "--json"]
 
@@ -318,7 +327,7 @@ class TestInstalledWheelValidationScript:
                         examples_pytest=["examples/rest_api_batch/tests"],
                     )
 
-        assert len(calls) == 15
+        assert len(calls) == 16
         assert calls[-2][0][-2:] == ["install", "pytest"]
         assert calls[-2][1] == work_dir / "outside"
         assert calls[-1][0][-3:] == ["pytest", "tests", "-q"]

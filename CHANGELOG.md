@@ -4,6 +4,13 @@ All notable user-facing changes are recorded here.
 
 ## Unreleased
 
+### Breaking
+
+- `rpacore init` now rejects invalid package basenames with usage error `2`
+  before creating directories or files. Use a valid basename such as
+  `my-project` instead of `my project`; accepted metadata spelling is preserved.
+  Existing generated projects and durable data require no migration.
+
 ### Fixed
 
 - HTML reports and email HTML now render unsafe or ambiguous screenshot paths

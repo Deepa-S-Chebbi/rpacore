@@ -14,6 +14,15 @@ Creates a normal Python project directory containing:
 - `tests/`
 - `.gitignore`
 
+The destination basename becomes `[project].name` unchanged. It must start and
+end with an ASCII letter or digit; interior characters may also include `.`,
+`_`, and `-`. Single letters/digits and repeated separators are accepted. Parent
+directories may contain spaces. Invalid basenames return exit code `2` with an
+explanation on stderr before any directories or files are created. For example,
+use `rpacore init my-project` instead of `rpacore init "my project"`. Existing
+generated projects are unchanged and require no data migration. A valid package
+name still requires an available filesystem destination.
+
 The generated `main.py` uses `execute_transaction(transaction_db_path=...)`
 with the project manifest's storage path, so execution and default inspection
 refer to the same durable transaction history. It also supplies a stable

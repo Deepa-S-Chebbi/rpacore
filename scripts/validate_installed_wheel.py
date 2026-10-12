@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import os
 import shutil
@@ -55,8 +56,10 @@ def _run(
 ) -> None:
     _validate_contained_path(cwd, allowed_roots=allowed_roots, label="command cwd")
     print(f"+ {' '.join(command)}")
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
     try:
-        subprocess.run(command, cwd=cwd, check=True)
+        subprocess.run(command, cwd=cwd, env=env, check=True)
     except subprocess.CalledProcessError as exc:
         raise ValidationError(
             f"command failed with exit code {exc.returncode}: {' '.join(command)}"
@@ -119,9 +122,11 @@ from pathlib import Path
 from html.parser import HTMLParser
 import io
 import importlib
+import importlib.metadata
 import json
 import platform
 import sqlite3
+import sys
 
 import rpacore
 from rpacore import (
@@ -153,6 +158,9 @@ checkout_package = repo_root / "rpacore"
 module_path = Path(rpacore.__file__).resolve()
 if module_path.parent == checkout_package:
     raise SystemExit(f"imported rpacore from checkout: {{module_path}}")
+assert module_path == Path(importlib.metadata.distribution("rpacore").locate_file("rpacore/__init__.py")).resolve()
+assert module_path.is_relative_to(Path(sys.prefix).resolve())
+print(f"Installed Core: {{module_path}}; OS: {{platform.platform()}}")
 if not module_path.with_name("py.typed").is_file():
     raise SystemExit(f"installed package missing py.typed: {{module_path}}")
 expected_public_exports = {tuple(_FROZEN_PUBLIC_EXPORTS)!r}
@@ -297,6 +305,68 @@ assert transition_record["schema_version"] == 2
 """
 
 
+def _scaffold_smoke_code() -> str:
+    return r'''
+from pathlib import Path
+import json
+import os
+import subprocess
+import sys
+import tomllib
+import zipfile
+
+# Provisioned tooling and --no-isolation avoid build dependency installation.
+# PIP_NO_INDEX disables pip index lookups; it does not block arbitrary network I/O.
+os.environ["PIP_NO_INDEX"] = "1"
+root = Path.cwd()
+cli = [sys.executable, "-m", "rpacore.cli"]
+
+def run(command, cwd):
+    result = subprocess.run(command, cwd=cwd, capture_output=True, text=True)
+    assert result.returncode == 0, (command, result.stdout, result.stderr)
+    return result
+
+for name in (
+    "my project", ".demo", "demo.", "_demo", "demo_", "-demo", "demo-",
+    'my"project', "my'project", "d\u00e9m\u00f8", "\u212aelvin", "demo\n", "demo\t", "demo\x01",
+):
+    parent = root / "invalid-parent" / "nested"
+    result = subprocess.run(cli + ["init", str(parent / name)], capture_output=True, text=True)
+    assert result.returncode == 2, (name, result.returncode, result.stderr)
+    assert result.stdout == "", (name, result.stdout)
+    assert "project basename" in result.stderr and "my-project" in result.stderr
+    assert not parent.parent.exists(), name
+
+for target in ("", ".", "..", "missing/.."):
+    before = set(root.iterdir())
+    result = subprocess.run(cli + ["init", target], capture_output=True, text=True)
+    assert result.returncode == 2 and result.stdout == "", (target, result)
+    assert set(root.iterdir()) == before
+
+inventory = {
+    "pyproject.toml", "rpacore.toml", "config.toml", "main.py", ".gitignore",
+    "steps/__init__.py", "steps/greeting.py", "tests/test_greeting_step.py",
+}
+for name in ("installed_project", "a", "1", "Demo.Project-1", "demo_project", "demo-project", "a..__--b"):
+    project = root / "parent with spaces" / "nested" / name
+    run(cli + ["init", str(project)], root)
+    assert {p.relative_to(project).as_posix() for p in project.rglob("*") if p.is_file()} == inventory
+    assert tomllib.loads((project / "pyproject.toml").read_text(encoding="utf-8"))["project"]["name"] == name
+    wheelhouse = root / "project-wheels" / name
+    run([sys.executable, "-m", "build", "--no-isolation", "--wheel", "--outdir", str(wheelhouse)], project)
+    wheels = list(wheelhouse.glob("*.whl"))
+    assert len(wheels) == 1 and zipfile.is_zipfile(wheels[0]), wheels
+    run([sys.executable, "-m", "pytest", "tests/test_greeting_step.py", "-q", "--basetemp", str(project / ".pytest-tmp")], project)
+    run(cli + ["run"], project)
+    assert (project / "greeting.txt").read_text(encoding="utf-8") == "Hello, Alice\n"
+    transactions = json.loads(run(cli + ["transaction", "list", "--json"], project).stdout)["transactions"]
+    assert len(transactions) == 1 and transactions[0]["status"] == "successful", transactions
+    assert transactions[0]["definition_identity"] == "generated-greeting/v1"
+    assert transactions[0]["steps"][0]["status"] == "successful"
+    print(f"Installed scaffold build/tests/run/persisted success passed: {name}")
+'''
+
+
 def validate_installed_wheel(
     *,
     repo_root: Path,
@@ -331,12 +401,17 @@ def validate_installed_wheel(
                 allowed_roots=allowed_run_roots,
             )
         wheel = _latest_wheel(wheelhouse)
+        print(f"Core wheel: {wheel.name}; SHA-256: {hashlib.sha256(wheel.read_bytes()).hexdigest()}")
 
         _run([sys.executable, "-m", "venv", str(venv_dir)], cwd=outside_dir, allowed_roots=allowed_run_roots)
         python = _venv_python(venv_dir)
-        _run([str(python), "-m", "pip", "install", str(wheel)], cwd=outside_dir, allowed_roots=allowed_run_roots)
+        _run([str(python), "-m", "pip", "install", "--no-index", "--no-deps", str(wheel)], cwd=outside_dir, allowed_roots=allowed_run_roots)
         _run([str(python), "-c", _smoke_code(repo_root)], cwd=outside_dir, allowed_roots=allowed_run_roots)
-        _run([str(python), "-m", "pip", "install", "mypy==2.1.0"], cwd=outside_dir, allowed_roots=allowed_run_roots)
+        _run(
+            [str(python), "-m", "pip", "install", "mypy==2.1.0", "build>=1.0", "setuptools>=77.0.0", "wheel>=0.46.2", "pytest>=8.1.1"],
+            cwd=outside_dir,
+            allowed_roots=allowed_run_roots,
+        )
         typing_consumer = outside_dir / "typing_consumer.py"
         typing_consumer.write_text(_typing_consumer_code(), encoding="utf-8")
         _run(
@@ -346,6 +421,7 @@ def validate_installed_wheel(
         )
         rpacore_cli = _venv_script(venv_dir, "rpacore")
         _run([str(rpacore_cli), "version"], cwd=outside_dir, allowed_roots=allowed_run_roots)
+        _run([str(python), "-c", _scaffold_smoke_code()], cwd=outside_dir, allowed_roots=allowed_run_roots)
         generated_project = outside_dir / "installed_project"
         if generated_project.exists():
             _remove_tree(generated_project)

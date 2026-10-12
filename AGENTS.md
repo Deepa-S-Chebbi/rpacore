@@ -16,7 +16,7 @@ These rules apply repository-wide. A nested `AGENTS.md` may add stricter local r
 
 Always read [docs/project-context.md](docs/project-context.md), use [docs/README.md](docs/README.md) to select only affected public contracts, and inspect live code/tests.
 
-For roadmap work, when the private planning tree exists, read `.internal/plans/README.md`, `.internal/plans/roadmap.md`, exactly the current linked task, and only its referenced decisions/evidence. The roadmap alone owns global order. `.internal/archive/` is historical, never a next-step list. If the private tree is absent, do not reconstruct or infer it.
+For task work, follow the assigned contract and the current planning guidance supplied for that assignment. Read only its named inputs and relevant decisions/evidence. Each project orders its own queue; cross-project blocking needs an explicit dependency. Historical notes are never a next-step list. Do not infer requirements from unavailable material.
 
 The user request defines the desired outcome; the current task defines its boundary. Live `rpacore/`, tests, public docs, and installed/released artifacts define actual behavior. Reconcile disagreements within scope or report the exact blocker—never silently choose one source.
 
@@ -73,9 +73,6 @@ python -m pytest -q
 # Tracked documentation
 python scripts/verify_docs.py --repo-root .
 git diff --check
-
-# Private plans, only when changed
-python .internal\plans\tools\validate_plans.py
 
 # Public API, CLI, packaging, generated-project, import, or version changes
 python scripts/validate_installed_wheel.py --repo-root .
