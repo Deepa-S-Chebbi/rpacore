@@ -61,7 +61,12 @@ class Finding:
 
 
 def _slug(text: str) -> str:
-    text = re.sub(r"`([^`]*)`", r"\1", text.strip().lower())
+    # Angle brackets inside inline code are literal text, not HTML tags.
+    text = re.sub(
+        r"`([^`]*)`",
+        lambda match: match.group(1).replace("<", "").replace(">", ""),
+        text.strip().lower(),
+    )
     text = re.sub(r"<[^>]+>", "", text)
     text = re.sub(r"[^\w\s-]", "", text)
     text = re.sub(r"\s+", "-", text)

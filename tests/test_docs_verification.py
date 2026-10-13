@@ -598,6 +598,22 @@ def test_run_check_reports_actionable_structured_finding() -> None:
 
 def test_slug_strips_markup_and_special_characters() -> None:
     assert _slug("`Engine.run()` and Storage!") == "enginerun-and-storage"
+    assert _slug("<em>Intro</em>") == "intro"
+
+
+def test_fragment_links_preserve_inline_code_placeholders(tmp_path: Path) -> None:
+    doc = tmp_path / "doc.md"
+    doc.write_text(
+        "## `rpacore init <project_name>`\n\n"
+        "[Valid](#rpacore-init-project_name)\n"
+        "[Invalid](#rpacore-init)\n",
+        encoding="utf-8",
+    )
+
+    assert _anchors(doc) == {"rpacore-init-project_name"}
+    assert [finding.message for finding in _check_links(tmp_path, [doc])] == [
+        "missing heading anchor: #rpacore-init"
+    ]
 
 
 def test_anchors_handles_duplicate_headings(tmp_path: Path) -> None:

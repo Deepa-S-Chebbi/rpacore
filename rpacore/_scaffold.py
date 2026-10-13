@@ -61,12 +61,14 @@ def _main_py() -> str:
     return textwrap.dedent("""\
         from __future__ import annotations
 
+        import sys
         from pathlib import Path
 
         from rpacore import (
             Engine,
             Status,
             Transaction,
+            configure_logger,
             execute_transaction,
             load_config,
             load_project_manifest,
@@ -77,6 +79,11 @@ def _main_py() -> str:
         def main() -> int:
             project_dir = Path(__file__).resolve().parent
             config = load_config(project_dir / "config.toml")
+            log_level = str(config["log_level"])
+            configure_logger(
+                level="DEBUG" if log_level == "NOTSET" else log_level,
+                fmt=str(config["log_format"]),
+            )
             manifest = load_project_manifest(project_dir)
             transaction = Transaction(
                 reference="generated-greeting",
@@ -95,12 +102,26 @@ def _main_py() -> str:
                 retry_backoff=float(config["retry_backoff"]),
                 screenshot_dir=str(config["screenshot_dir"]),
             )
-            execute_transaction(
-                transaction,
-                config=config,
-                engine=engine,
-                transaction_db_path=manifest.transaction_db_path,
+            inspection = (
+                f"Database: {manifest.transaction_db_path}\\n"
+                f"Inspect from project directory: {project_dir}\\n"
+                f"rpacore transaction show {transaction.id}"
             )
+            try:
+                execute_transaction(
+                    transaction,
+                    config=config,
+                    engine=engine,
+                    transaction_db_path=manifest.transaction_db_path,
+                )
+            except Exception:
+                print(
+                    f"Transaction {transaction.id}: aborted; durable outcome is unconfirmed\\n"
+                    f"{inspection}",
+                    file=sys.stderr,
+                )
+                raise
+            print(f"Transaction {transaction.id}: {transaction.status}\\n{inspection}")
             return 0 if transaction.status is Status.SUCCESSFUL else 1
 
 

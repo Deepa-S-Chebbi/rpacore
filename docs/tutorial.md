@@ -169,6 +169,12 @@ if __name__ == "__main__":
     main()
 ```
 
+This hand-written entrypoint prints a shorter transaction ID/status receipt
+to teach application wiring. Newly scaffolded entrypoints also print the
+database path, project directory, and inspection command, and explain
+unconfirmed durability when execution raises an ordinary exception; see the
+[CLI reference](cli.md).
+
 `execute_transaction()` makes the run crash-durable at engine state boundaries:
 the transaction is saved before user step code starts and after each status
 transition. Its definition identity is an application-owned compatibility token,

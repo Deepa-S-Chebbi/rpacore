@@ -2,13 +2,9 @@
 
 from __future__ import annotations
 
-import os
 import json
 import sqlite3
-import subprocess
-import sys
 import textwrap
-import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -31,27 +27,7 @@ from rpacore import (
     save_transaction,
 )
 from rpacore.persistence import _delete_unbound_pending_transaction
-
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-
-
-def run_cli(*args: str, cwd: Path) -> subprocess.CompletedProcess[str]:
-    env = os.environ.copy()
-    existing_python_path = env.get("PYTHONPATH")
-    env["PYTHONPATH"] = (
-        str(REPO_ROOT)
-        if existing_python_path is None
-        else str(REPO_ROOT) + os.pathsep + existing_python_path
-    )
-    return subprocess.run(
-        [sys.executable, "-m", "rpacore.cli", *args],
-        cwd=cwd,
-        env=env,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+from tests.cli_helpers import run_cli
 
 
 def query_page_for(*transactions: Transaction) -> TransactionPage:
@@ -217,148 +193,6 @@ class TestCliRun:
 
         assert result.returncode == 0
         assert result.stderr == ""
-
-
-class TestCliInit:
-    @pytest.mark.parametrize("name", [
-        "my project", ".demo", "demo.", "_demo", "demo_", "-demo", "demo-",
-        'my"project', "my'project", "démø", "Kelvin", "demo\n", "demo\t", "demo\x01",
-    ])
-    def test_init_invalid_name_does_not_create_parents(self, tmp_path: Path, name: str) -> None:
-        parent = tmp_path / "missing" / "nested"
-
-        result = run_cli("init", str(parent / name), cwd=tmp_path)
-
-        assert result.returncode == 2
-        assert result.stdout == ""
-        assert "project basename" in result.stderr
-        assert "my-project" in result.stderr
-        assert list(tmp_path.iterdir()) == []
-
-    @pytest.mark.parametrize("target", ["", ".", "..", "missing/.."])
-    def test_init_directory_references_are_usage_errors(self, tmp_path: Path, target: str) -> None:
-        result = run_cli("init", target, cwd=tmp_path)
-
-        assert result.returncode == 2
-        assert result.stdout == ""
-        assert list(tmp_path.iterdir()) == []
-
-    @pytest.mark.parametrize("name", ["a", "1", "Demo.Project-1", "demo_project", "demo-project", "a..__--b"])
-    def test_init_preserves_valid_name_with_spaces_in_parent(self, tmp_path: Path, name: str) -> None:
-        project = tmp_path / "parent with spaces" / "nested" / name
-
-        result = run_cli("init", str(project), cwd=tmp_path)
-
-        assert result.returncode == 0, result.stderr
-        assert result.stderr == ""
-        metadata = tomllib.loads((project / "pyproject.toml").read_text(encoding="utf-8"))
-        assert metadata["project"]["name"] == name
-
-    def test_init_creates_project_that_runs_without_edits(self, tmp_path: Path) -> None:
-        result = run_cli("init", "demo_project", cwd=tmp_path)
-
-        assert result.returncode == 0
-        assert "Created RPA Core project: demo_project" in result.stdout
-        project = tmp_path / "demo_project"
-        assert (project / "pyproject.toml").exists()
-        assert (project / "rpacore.toml").exists()
-        assert (project / "config.toml").exists()
-        assert (project / "main.py").exists()
-        assert (project / "steps" / "__init__.py").exists()
-        assert (project / "steps" / "greeting.py").exists()
-        assert (project / "tests" / "test_greeting_step.py").exists()
-        assert (project / ".gitignore").exists()
-        assert not (project / "LICENSE").exists()
-        assert not (project / "NOTICE").exists()
-        assert "transaction_db_path" not in (project / "config.toml").read_text(
-            encoding="utf-8"
-        )
-
-        run_result = run_cli("run", cwd=project)
-
-        assert run_result.returncode == 0
-        assert run_result.stderr == ""
-        assert (project / "greeting.txt").read_text(encoding="utf-8") == "Hello, Alice\n"
-        assert (project / "rpacore.db").exists()
-        assert "execute_transaction(" in (
-            project / "main.py"
-        ).read_text(encoding="utf-8")
-        assert "load_project_manifest" in (project / "main.py").read_text(encoding="utf-8")
-        transactions = list_transactions(str(project / "rpacore.db"))
-        assert len(transactions) == 1
-        assert transactions[0].status is Status.SUCCESSFUL
-        assert transactions[0].definition_identity == "generated-greeting/v1"
-        assert HistoryEvent.STEP_SUCCEEDED in [
-            entry.event for entry in transactions[0].history
-        ]
-
-    def test_generated_project_step_test_passes(self, tmp_path: Path) -> None:
-        init_result = run_cli("init", "demo_project", cwd=tmp_path)
-        assert init_result.returncode == 0
-        project = tmp_path / "demo_project"
-        env = os.environ.copy()
-        env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + str(project)
-
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "pytest",
-                "--basetemp",
-                str(tmp_path / "inner-pytest-tmp"),
-                "tests/test_greeting_step.py",
-            ],
-            cwd=project,
-            env=env,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-
-        assert result.returncode == 0
-
-    def test_init_existing_path_exits_two(self, tmp_path: Path) -> None:
-        (tmp_path / "demo_project").mkdir()
-
-        result = run_cli("init", "demo_project", cwd=tmp_path)
-
-        assert result.returncode == 2
-        assert "Project path already exists" in result.stderr
-
-    def test_init_invalid_name_precedes_existing_path_error(self, tmp_path: Path) -> None:
-        project = tmp_path / "my project"
-        project.mkdir()
-        existing_file = project / "keep.txt"
-        existing_file.write_text("preserve me", encoding="utf-8")
-
-        result = run_cli("init", str(project), cwd=tmp_path)
-
-        assert result.returncode == 2
-        assert result.stdout == ""
-        assert "Invalid project basename" in result.stderr
-        assert "Project path already exists" not in result.stderr
-        assert list(tmp_path.iterdir()) == [project]
-        assert list(project.iterdir()) == [existing_file]
-        assert existing_file.read_text(encoding="utf-8") == "preserve me"
-
-    def test_init_write_failure_exits_one_and_reports_cleanup(
-        self,
-        tmp_path: Path,
-        capsys,
-        monkeypatch,
-    ) -> None:
-        def fail_write(project_dir: Path) -> None:
-            raise OSError("disk full")
-
-        monkeypatch.setattr(cli_module, "_write_project_files", fail_write)
-
-        result = cli_module.main(["init", str(tmp_path / "demo_project")])
-
-        captured = capsys.readouterr()
-        assert result == 1
-        assert "Could not create project" in captured.err
-        assert "disk full" in captured.err
-        assert not (tmp_path / "demo_project").exists()
 
 
 class TestCliDoctor:

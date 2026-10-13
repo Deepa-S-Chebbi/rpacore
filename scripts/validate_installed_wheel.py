@@ -364,6 +364,39 @@ for name in ("installed_project", "a", "1", "Demo.Project-1", "demo_project", "d
     assert transactions[0]["definition_identity"] == "generated-greeting/v1"
     assert transactions[0]["steps"][0]["status"] == "successful"
     print(f"Installed scaffold build/tests/run/persisted success passed: {name}")
+
+# Receipt publication under this exact installed Core wheel; source pytest owns
+# the logging, failure-category, and initial/final checkpoint scenario matrix.
+project = root / "parent with spaces" / "receipt-journey"
+run(cli + ["init", str(project)], root)
+result = run(cli + ["run"], project)
+assert result.stdout.strip() and ": successful" in result.stdout, result.stdout
+
+# Fail the final checkpoint after real SQLite writes and successful step work.
+# This custom callback bypasses Core's transient-lock retry wrapper.
+# Mirrors the final-boundary probe in tests/test_generated_project.py.
+main_path = project / "main.py"
+injection = (
+    "from rpacore import save_transaction\n"
+    "real_execute_transaction = execute_transaction\n"
+    "def execute_transaction(transaction, **kwargs):\n"
+    "    db_path = kwargs.pop('transaction_db_path')\n"
+    "    def checkpoint(tx):\n"
+    "        if tx.status is Status.SUCCESSFUL:\n"
+    "            raise RuntimeError('controlled-final-checkpoint-failure')\n"
+    "        save_transaction(tx, db_path=db_path)\n"
+    "    real_execute_transaction(transaction, checkpoint=checkpoint, **kwargs)\n\n"
+)
+source = main_path.read_text(encoding="utf-8")
+needle = "def main() -> int:"
+assert needle in source
+main_path.write_text(source.replace(needle, injection + needle), encoding="utf-8")
+result = subprocess.run(cli + ["run"], cwd=project, capture_output=True, text=True)
+assert result.returncode == 1 and result.stdout == "", result
+assert "durable outcome is unconfirmed" in result.stderr, result.stderr
+assert "Project execution failed: controlled-final-checkpoint-failure" in result.stderr
+print("Installed receipt smoke passed: successful run and final-checkpoint abort")
+print("Limitation: custom checkpoint injection bypasses transient SQLite retries")
 '''
 
 

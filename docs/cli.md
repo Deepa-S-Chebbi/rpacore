@@ -29,6 +29,38 @@ refer to the same durable transaction history. It also supplies a stable
 application-owned `definition_identity` so an interrupted run can be resumed
 only by a compatible automation definition.
 
+Newly generated entrypoints configure framework logging from `config.toml`'s
+`log_level` and `log_format`; earlier scaffolds did not configure logging.
+Invalid values are rejected by `load_config` before transaction execution.
+Generated entrypoints treat `NOTSET` as `DEBUG`, enabling all framework levels
+without inheriting the root logger's threshold. Text or JSON logs go
+to stderr, including step-failure exception messages without content redaction.
+After execution returns normally, stdout contains a human receipt with the
+transaction ID, terminal status, resolved database path, project directory, and
+`rpacore transaction show <actual-id>`. Run that inspection command from the
+displayed project directory. A saved failed transaction receives the same
+receipt and exits `1`; a saved successful transaction exits `0`. Log filtering
+does not suppress the receipt.
+
+If execution or a checkpoint raises an ordinary exception, the generated
+entrypoint reports the attempted ID, database path, and inspection action on
+stderr, with durable outcome explicitly unconfirmed. It then propagates the
+original error. An in-memory successful status or completion log can precede
+a failed final save; inspect the database before deciding how to recover.
+Inspection may find no record or an earlier checkpoint. A second plain
+`rpacore run` starts a new transaction with a new ID; it does not resume the
+previous record.
+
+`SystemExit` and `KeyboardInterrupt` propagate directly without a generated
+receipt or abort diagnostic. An exit code alone does not confirm persistence;
+use read-only transaction inspection after an interrupted run.
+
+Receipts expose local project/storage paths but omit state, arguments, config
+values, artifact contents, and exception payloads. Framework and CLI exception
+logs still follow the [security guidance](security.md). These behaviors apply
+to future scaffolds; existing projects require no migration. Arbitrary
+entrypoints continue to own their output and exit semantics.
+
 RPA Core distributions include the framework's `LICENSE` and `NOTICE`. The
 generated project does not copy those files or add a package license field,
 because the generated automation is user-owned project code. Add your own
@@ -50,6 +82,10 @@ entrypoint package only when it belongs to another project. The resolver never
 purges modules outside the entrypoint's top-level package, although ordinary
 Python imports may cache external dependencies. The process working directory
 is unchanged.
+
+For generated entrypoints, see the
+[generated-run output contract](#rpacore-init-project_name) for stdout receipts,
+stderr logs, and unconfirmed-durability diagnostics.
 
 Exit codes:
 

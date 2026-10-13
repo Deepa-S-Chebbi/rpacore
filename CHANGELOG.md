@@ -4,6 +4,19 @@ All notable user-facing changes are recorded here.
 
 ## Unreleased
 
+### Added
+
+- Newly scaffolded projects enable configured framework logging on stderr,
+  including verbatim step-failure exception messages under the existing
+  security policy. Logging values retain existing load-time validation;
+  generated entrypoints treat `NOTSET` as `DEBUG`. They
+  print a human run receipt with transaction identity, saved outcome, storage
+  path, and inspection guidance. Ordinary execution/checkpoint exceptions
+  instead report unconfirmed durability on stderr and propagate the original
+  error.
+  Another plain run creates a new transaction. Existing projects are unchanged
+  and require no migration.
+
 ### Breaking
 
 - `rpacore init` now rejects invalid package basenames with usage error `2`

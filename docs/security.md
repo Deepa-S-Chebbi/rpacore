@@ -67,6 +67,10 @@ and is not proof that either side has durably committed the fact.
 
 ## Credentials and Generated Projects
 
+Newly generated projects log to stderr by default, including verbatim
+step-failure exception text; apply access controls and retention policies to
+captured logs.
+
 Generated projects default to the environment credential provider. Environment
 variables and OS keyrings are read at runtime; their resolved secret values
 should not be copied into transaction state, metadata, logs, reports, or exports.
