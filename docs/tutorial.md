@@ -52,6 +52,18 @@ New-Item -ItemType File steps\__init__.py | Out-Null
 User automations live outside the framework package. This keeps application code
 separate from `rpacore` itself.
 
+For a runnable starting point instead, `rpacore init hello-rpacore` creates a
+project with a manifest, configured logging, and run receipts. Before running
+it, `rpacore doctor` reports absent discovered storage as unchecked; verify its
+configured location and any recovery/backup needs before creating new storage.
+The generated `generated-greeting/v2` definition writes `greeting.txt` atomically
+in the project root even from a nested working directory. Its persisted output
+argument, state, and artifact expose an absolute local path: copied records keep
+that original destination on resume, while a fresh run uses the current root.
+Earlier v1 projects remain unchanged and require no migration. The remaining
+steps below describe a separate hand-written application with its own definition
+and path choices.
+
 ## Step 3: Create A Virtual Environment
 
 ```powershell

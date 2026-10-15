@@ -87,12 +87,12 @@ def _main_py() -> str:
             manifest = load_project_manifest(project_dir)
             transaction = Transaction(
                 reference="generated-greeting",
-                definition_identity="generated-greeting/v1",
+                definition_identity="generated-greeting/v2",
                 steps=[
                     WriteGreeting(
                         name="write_greeting",
                         execution_order=1,
-                        arguments={"name": "Alice", "output_path": "greeting.txt"},
+                        arguments={"name": "Alice", "output_path": str(project_dir / "greeting.txt")},
                     ),
                 ],
             )
@@ -136,7 +136,7 @@ def _greeting_step_py() -> str:
 
         from pathlib import Path
 
-        from rpacore import BusinessException, ProcessContext, Step
+        from rpacore import BusinessException, ProcessContext, Step, atomic_output_path
 
 
         class WriteGreeting(Step):
@@ -146,7 +146,11 @@ def _greeting_step_py() -> str:
                     raise BusinessException("'name' must be a non-empty string", action=self.name)
 
                 output_path = Path(str(self.arguments.get("output_path", "greeting.txt")))
-                output_path.write_text(f"Hello, {name}\\n", encoding="utf-8")
+                if not output_path.is_absolute():
+                    output_path = Path(__file__).resolve().parent.parent / output_path
+                output_path = output_path.resolve()
+                with atomic_output_path(output_path) as temporary:
+                    temporary.write_text(f"Hello, {name}\\n", encoding="utf-8", newline="\\n")
                 ctx.state["greeting_path"] = str(output_path)
                 ctx.add_artifact(
                     "greeting",

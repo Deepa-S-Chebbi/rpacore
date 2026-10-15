@@ -215,6 +215,10 @@ retyping, or changing the meaning of one requires a new version. Existing
 conditional fields retain their documented conditions; they do not create a
 general extension point.
 
+Doctor format v1 check details include the optional `reason`, `cause`, and
+`location` diagnostics documented in the [CLI reference](cli.md#rpacore-doctor).
+These scalar details do not change the envelope, check IDs, or status vocabulary.
+
 Query cursors are opaque. Pass a cursor only back to the matching
 `query_transactions()` call; the framework accepts its supported cursor version
 and rejects unsupported versions. JSON log v3 keeps a protected envelope and

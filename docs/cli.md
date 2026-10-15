@@ -29,6 +29,17 @@ refer to the same durable transaction history. It also supplies a stable
 application-owned `definition_identity` so an interrupted run can be resumed
 only by a compatible automation definition.
 
+New scaffolds use `generated-greeting/v2`. Their default `greeting.txt` is
+anchored to the project root, including runs from nested directories. The step
+publishes a complete temporary sibling with `atomic_output_path` before recording
+state/artifact metadata. Re-execution replaces the same greeting bytes rather
+than appending; publication and the SQLite checkpoint are separate operations.
+The output argument, state, and artifact store the same absolute destination.
+Inspection and exports can therefore expose account/directory names. A copied
+record retains its original destination on resume; a fresh run after moving the
+project computes the new project root. Existing v1 projects/records are unchanged
+and require no migration; v2 code must not be used to resume v1 records.
+
 Newly generated entrypoints configure framework logging from `config.toml`'s
 `log_level` and `log_format`; earlier scaffolds did not configure logging.
 Invalid values are rejected by `load_config` before transaction execution.
@@ -118,9 +129,16 @@ rpacore doctor --config path/to/config.toml --json
 
 The default command discovers `rpacore.toml` from the current directory and,
 when present, uses its transaction database path and sibling `config.toml`.
-`--transaction-db`, `--queue-db`, and `--config` select explicit inputs.
-Missing default inputs are reported as `not_applicable`; unavailable, malformed,
-or incompatible explicit inputs are `fail` checks. Database checks cover current
+Direct `--transaction-db` and `--queue-db` flags select explicit storage;
+missing paths fail. `--config` selects an explicit configuration file whose
+absence or invalidity fails. A queue database obtained from a valid config,
+including one selected with `--config`, is discovered storage. Absent discovered
+storage is `not_applicable`: it is unchecked and may not yet exist or may have
+been removed. Verify the configured location and recovery/backup for established
+deployments before running work that could create a new database. Absence does
+not establish health or intact data. Missing default manifest/config inputs are
+also `not_applicable`; found unreadable/invalid inputs and existing malformed,
+incompatible, directory, or unreadable databases fail. Database checks cover current
 schema compatibility, journal mode, SQLite `quick_check`, foreign-key integrity,
 and bounded queue counts/claim-binding facts. The JSON result is doctor format
 v1 with `pass`, `warning`, `fail`, or `not_applicable` check statuses. JSON
@@ -131,7 +149,16 @@ Doctor format v1 always emits these check IDs: `runtime.python`,
 `transactions.schema`, `transactions.journal`, `transactions.quick_check`,
 `transactions.foreign_keys`, `queue.schema`, `queue.journal`,
 `queue.quick_check`, `queue.foreign_keys`, and `queue.health`. Database schema
-details contain `version`; journal details contain `mode`; queue-health details
+details contain `version` when checked. An absent discovered database's schema
+check instead has optional `reason="missing_discovered_database"`; no-selection,
+deeper skipped checks, and WAL checks do not carry that reason. Failed manifest
+and config checks have optional `cause`: `toml_syntax`, `invalid_shape`,
+`invalid_type`, `invalid_value`, `unreadable`, or `unexpected`. TOML syntax errors
+also have optional `location`, normalized as `line N, column M` or
+`end of document` when the parser supplies a recognized location. Unrecognized
+locations are omitted. Human summaries show these same safe causes/locations,
+without validator messages, offending values, or source excerpts.
+Journal details contain `mode`; queue-health details
 contain scalar `pending_items`, `in_progress_items`, `successful_items`,
 `failed_items`, `unknown_status_items`, `bound_items`, and, when available,
 `oldest_age_seconds`. When a SQLite header reports WAL, Doctor does not open the

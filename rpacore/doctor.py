@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import platform
 import sqlite3
+import stat
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
 from rpacore import __version__
+from rpacore._doctor_errors import input_error_details
 from rpacore._sqlite import (
     QUEUE_SCHEMA_VERSION,
     TRANSACTION_SCHEMA_VERSION,
@@ -105,6 +107,7 @@ def collect_doctor_result(
             label="Transaction",
             db_path=selected_transaction_path,
             supported_version=TRANSACTION_SCHEMA_VERSION,
+            explicit=transaction_db_path is not None,
         )
     )
 
@@ -121,6 +124,7 @@ def collect_doctor_result(
             label="Queue",
             db_path=selected_queue_path,
             supported_version=QUEUE_SCHEMA_VERSION,
+            explicit=queue_db_path is not None,
         )
     )
     if selected_queue_path is None:
@@ -132,13 +136,26 @@ def collect_doctor_result(
 
 def _discover_manifest() -> tuple[ProjectManifest | None, list[DoctorCheck]]:
     try:
-        find_project_manifest()
-        manifest = load_project_manifest()
+        candidate = find_project_manifest()
     except FileNotFoundError:
         return None, [DoctorCheck("project.manifest", NOT_APPLICABLE, "No project manifest found")]
-    except Exception:
-        return None, [DoctorCheck("project.manifest", FAIL, "Project manifest is invalid or unreadable")]
+    except Exception as exc:
+        return None, [_input_failure("project.manifest", "Project manifest", exc)]
+    try:
+        manifest = load_project_manifest(candidate)
+    except Exception as exc:
+        return None, [_input_failure("project.manifest", "Project manifest", exc)]
     return manifest, [DoctorCheck("project.manifest", PASS, "Project manifest is valid")]
+
+
+def _input_failure(check_id: str, label: str, exc: Exception) -> DoctorCheck:
+    details = input_error_details(exc)
+    location = f" ({details['location']})" if "location" in details else ""
+    return DoctorCheck(
+        check_id, FAIL,
+        f"{label}: {details['cause']}{location}; check the file's syntax, fields, and readability",
+        details,
+    )
 
 
 def _discover_config(
@@ -152,17 +169,23 @@ def _discover_config(
         candidate = Path(config_path)
     elif manifest_dir is not None:
         candidate = manifest_dir / "config.toml"
-    if candidate is None or not candidate.is_file():
-        status = FAIL if explicit else NOT_APPLICABLE
-        summary = "Configuration file is unavailable" if explicit else "No configuration file selected"
-        return None, [DoctorCheck("project.config", status, summary)]
+    if candidate is None:
+        return None, [DoctorCheck("project.config", NOT_APPLICABLE, "No configuration file selected")]
+    try:
+        candidate.stat()
+    except FileNotFoundError as exc:
+        if explicit:
+            return None, [_input_failure("project.config", "Configuration file", exc)]
+        return None, [DoctorCheck("project.config", NOT_APPLICABLE, "No configuration file selected")]
+    except Exception as exc:
+        return None, [_input_failure("project.config", "Configuration file", exc)]
     try:
         config = load_config(candidate, require_file=True)
-    except Exception:
-        return None, [DoctorCheck("project.config", FAIL, "Configuration file is invalid or unreadable")]
+    except Exception as exc:
+        return None, [_input_failure("project.config", "Configuration file", exc)]
     queue = config.get("queue")
     if queue is not None and not isinstance(queue, dict):
-        return None, [DoctorCheck("project.config", FAIL, "Configuration file has an invalid queue section")]
+        return None, [_input_failure("project.config", "Configuration file", TypeError())]
     return config, [DoctorCheck("project.config", PASS, "Configuration file is valid")]
 
 
@@ -172,6 +195,7 @@ def _database_checks(
     label: str,
     db_path: str | None,
     supported_version: int,
+    explicit: bool,
 ) -> list[DoctorCheck]:
     prefix = component
     if db_path is None:
@@ -181,6 +205,19 @@ def _database_checks(
             db_path,
             field=f"doctor.{component}_db_path",
         )
+    except FileNotFoundError:
+        if not explicit:
+            summary = (
+                f"{label} database is absent and unchecked: it may not yet be created or may have been removed; "
+                "verify the configured location and recovery/backup for established deployments before running work"
+            )
+            checks = _not_applicable_database_checks(prefix, summary)
+            checks[0] = DoctorCheck(
+                f"{prefix}.schema", NOT_APPLICABLE, summary,
+                {"reason": "missing_discovered_database"},
+            )
+            return checks
+        return _failed_database_checks(prefix, f"{label} database is unavailable")
     except Exception:
         return _failed_database_checks(prefix, f"{label} database is unavailable")
     if header_journal_mode == "not_sqlite":
@@ -288,8 +325,8 @@ def _database_header_journal_mode(db_path: str, *, field: str) -> str:
     """Read the SQLite header without opening a connection or WAL sidecar."""
     validated = validate_durable_sqlite_path(db_path, field=field)
     resolved = Path(validated).resolve()
-    if not resolved.is_file():
-        raise FileNotFoundError
+    if not stat.S_ISREG(resolved.stat().st_mode):
+        raise OSError("Database path is not a regular file")
     with resolved.open("rb") as database_file:
         header = database_file.read(100)
     if header[:16] != b"SQLite format 3\x00":
@@ -308,6 +345,8 @@ def _queue_health_check(db_path: str) -> DoctorCheck:
         if header_journal_mode == "wal":
             return DoctorCheck("queue.health", NOT_APPLICABLE, "WAL queue database was not opened")
         connection = connect_sqlite(db_path, field="doctor.queue_db_path", readonly=True)
+    except FileNotFoundError:
+        return DoctorCheck("queue.health", NOT_APPLICABLE, "Queue database is absent and unchecked")
     except Exception:
         return DoctorCheck("queue.health", NOT_APPLICABLE, "Queue database is unavailable")
     try:

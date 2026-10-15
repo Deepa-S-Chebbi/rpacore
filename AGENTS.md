@@ -84,4 +84,4 @@ Report exact commands/results and skipped gates with reasons. Never claim a chec
 
 ## Completion
 
-Report outcome, changed contracts/files, compatibility and migration impact, examples-repository impact, remaining risks, and final staged/unstaged state. Do not call work complete because code exists, a prior run was green, or an ignored review says so.
+Report outcome, changed contracts/files, compatibility and migration impact, examples-repository impact, and remaining risks. Keep transient Git staging state out of Markdown records. Do not call work complete because code exists, a prior run was green, or an ignored review says so.

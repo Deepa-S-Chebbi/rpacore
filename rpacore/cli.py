@@ -198,9 +198,12 @@ def _init_project(project_dir: Path) -> int:
 
 
 def _inspect_transactions(args: argparse.Namespace) -> int:
-    db_path = ""
     try:
         db_path = _transaction_db_path(args.db_path)
+    except Exception as exc:
+        _print_error(str(exc))
+        return EXECUTION_ERROR
+    try:
         if args.transaction_command == "list":
             transactions = list(_iter_queried_transactions(db_path, limit=args.limit))
             if args.json:
@@ -302,7 +305,7 @@ def _transaction_db_path(db_path: str | None) -> str:
         return load_project_manifest().transaction_db_path
     except Exception as exc:
         raise RuntimeError(
-            f"could not resolve transaction database from rpacore.toml; pass --db: {exc}"
+            f"Could not resolve transaction database from rpacore.toml; pass --db: {exc}"
         ) from exc
 
 

@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import stat
 import textwrap
+import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
 import rpacore.cli as cli_module
+import rpacore.doctor as doctor_module
+from rpacore._doctor_errors import input_error_details
 from rpacore.doctor import collect_doctor_result
 from rpacore import (
     Artifact,
@@ -196,6 +200,239 @@ class TestCliRun:
 
 
 class TestCliDoctor:
+    @pytest.mark.parametrize("explicit_config", [False, True])
+    def test_missing_discovered_storage_is_unchecked_even_after_removal(self, tmp_path, explicit_config):
+        project = write_project(tmp_path, "raise RuntimeError('must not import')\n")
+        config = project / "config.toml"
+        config.write_text('[queue]\ndb_path = "queue.db"\n', encoding="utf-8")
+        args = ("--config", str(config)) if explicit_config else ()
+        for previously_created in (False, True):
+            if previously_created:
+                save_transaction(Transaction(reference="removed"), str(project / "rpacore.db"))
+                SqliteQueue({"db_path": str(project / "queue.db")}).add(QueueItem(reference="removed", payload={}))
+                (project / "rpacore.db").unlink()
+                (project / "queue.db").unlink()
+            before = {p: p.read_bytes() for p in project.rglob("*") if p.is_file()}
+            result = run_cli("doctor", *args, "--json", cwd=project)
+            assert result.returncode == 0 and result.stderr == ""
+            payload = json.loads(result.stdout)
+            assert set(payload) == {"doctor_format_version", "framework_version", "checks"}
+            assert payload["doctor_format_version"] == 1
+            checks = {c["id"]: c for c in payload["checks"]}
+            for component in ("transactions", "queue"):
+                schema = checks[f"{component}.schema"]
+                assert schema["status"] == "not_applicable"
+                assert schema["details"] == {"reason": "missing_discovered_database"}
+                for deeper in ("journal", "quick_check", "foreign_keys"):
+                    assert checks[f"{component}.{deeper}"]["status"] == "not_applicable"
+                    assert checks[f"{component}.{deeper}"]["details"] == {}
+            assert checks["queue.health"]["status"] == "not_applicable"
+            assert "absent" in checks["queue.health"]["summary"]
+            assert "unchecked" in checks["queue.health"]["summary"]
+            human = run_cli("doctor", *args, cwd=project)
+            assert human.returncode == 0
+            for word in ("unchecked", "removed", "configured location", "recovery/backup", "before running"):
+                assert word in human.stdout
+            assert {p: p.read_bytes() for p in project.rglob("*") if p.is_file()} == before
+        for flag in ("--transaction-db", "--queue-db"):
+            result = run_cli("doctor", flag, str(project / "missing.db"), "--json", cwd=project)
+            assert result.returncode == 1 and result.stderr == ""
+            component = "queue" if flag == "--queue-db" else "transactions"
+            checks = {c["id"]: c for c in json.loads(result.stdout)["checks"]}
+            assert checks[f"{component}.schema"]["status"] == "fail"
+            assert checks[f"{component}.schema"]["details"] == {}
+
+    @pytest.mark.parametrize("component", ["transactions", "queue"])
+    @pytest.mark.parametrize("kind", ["directory", "non_sqlite", "old", "future", "malformed"])
+    def test_existing_discovered_bad_storage_fails_without_mutation(self, tmp_path, component, kind):
+        project = write_project(tmp_path, "raise RuntimeError('must not import')\n")
+        (project / "config.toml").write_text('[queue]\ndb_path = "queue.db"\n', encoding="utf-8")
+        path = project / ("queue.db" if component == "queue" else "rpacore.db")
+        if kind == "directory":
+            path.mkdir()
+        elif kind == "non_sqlite":
+            path.write_bytes(b"not sqlite")
+        elif kind == "malformed":
+            path.write_bytes(b"SQLite format 3\x00" + b"\x00" * 84)
+        else:
+            with sqlite3.connect(path) as conn:
+                conn.execute("CREATE TABLE rpacore_schema_versions (component TEXT PRIMARY KEY, version INTEGER NOT NULL)")
+                conn.execute("INSERT INTO rpacore_schema_versions VALUES (?, ?)", (component, 0 if kind == "old" else 99))
+        before = {p: p.read_bytes() for p in project.rglob("*") if p.is_file()}
+        result = run_cli("doctor", "--json", cwd=project)
+        assert result.returncode == 1 and result.stderr == ""
+        checks = {c["id"]: c for c in json.loads(result.stdout)["checks"]}
+        assert checks[f"{component}.schema"]["status"] == "fail"
+        assert checks[f"{component}.schema"]["details"] == {}
+        assert {p: p.read_bytes() for p in project.rglob("*") if p.is_file()} == before
+
+    @pytest.mark.parametrize("target", ["manifest", "config", "database"])
+    def test_unreadable_discovered_inputs_are_failures(self, tmp_path, monkeypatch, target):
+        project = write_project(tmp_path, "raise RuntimeError('must not import')\n")
+        config = project / "config.toml"
+        config.write_text("", encoding="utf-8")
+        (project / "rpacore.db").write_bytes(b"existing database")
+        monkeypatch.chdir(project)
+        def denied(*args, **kwargs):
+            raise PermissionError("private-marker")
+        if target == "manifest":
+            monkeypatch.setattr(doctor_module, "load_project_manifest", denied)
+        elif target == "config":
+            monkeypatch.setattr(doctor_module, "load_config", denied)
+        else:
+            monkeypatch.setattr(Path, "open", denied)
+        result = collect_doctor_result()
+        assert result.exit_code == 1
+        check_id = "transactions.schema" if target == "database" else f"project.{target}"
+        check = next(c for c in result.checks if c.id == check_id)
+        assert check.status == "fail"
+        if target != "database":
+            assert check.details == {"cause": "unreadable"}
+        assert "private-marker" not in json.dumps(result.to_dict())
+
+    @pytest.mark.parametrize("exception,cause", [
+        (PermissionError("private-discovery-marker"), "unreadable"),
+        (RuntimeError("private-discovery-marker"), "unexpected"),
+    ])
+    def test_manifest_discovery_failures_are_bounded(self, tmp_path, monkeypatch, exception, cause):
+        monkeypatch.chdir(tmp_path)
+        def fail_discovery():
+            raise exception
+        monkeypatch.setattr(doctor_module, "find_project_manifest", fail_discovery)
+        result = collect_doctor_result()
+        checks = [check for check in result.checks if check.id == "project.manifest"]
+        assert len(checks) == 1 and checks[0].status == "fail"
+        assert checks[0].details == {"cause": cause}
+        assert result.exit_code == 1
+        assert "private-discovery-marker" not in json.dumps(result.to_dict())
+        assert "check the file" in checks[0].summary
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.parametrize("target", ["manifest", "discovered_config", "explicit_config"])
+    def test_directory_inputs_fail_without_storage_creation(self, tmp_path, target):
+        project = write_project(tmp_path, "raise RuntimeError('must not import')\n")
+        if target == "manifest":
+            manifest = project / "rpacore.toml"
+            manifest.unlink()
+            manifest.mkdir()
+            args = ()
+        else:
+            config = project / "config.toml"
+            config.mkdir()
+            args = ("--config", str(config)) if target == "explicit_config" else ()
+        before = {p.relative_to(project): p.read_bytes() if p.is_file() else None for p in project.rglob("*")}
+        result = run_cli("doctor", *args, "--json", cwd=project)
+        assert result.returncode == 1 and result.stderr == ""
+        checks = {check["id"]: check for check in json.loads(result.stdout)["checks"]}
+        check = checks["project.manifest" if target == "manifest" else "project.config"]
+        assert check["status"] == "fail" and check["details"] == {"cause": "unreadable"}
+        assert "check the file" in check["summary"]
+        human = run_cli("doctor", *args, cwd=project)
+        assert human.returncode == 1 and "unreadable" in human.stdout
+        assert "check the file" in human.stdout and human.stderr == ""
+        assert {p.relative_to(project): p.read_bytes() if p.is_file() else None for p in project.rglob("*")} == before
+
+    @pytest.mark.parametrize("filename,source,cause,location", [
+        ("rpacore.toml", '[project]\nentrypoint = "secret-marker" extra\n', "toml_syntax", "line 2, column 30"),
+        ("config.toml", 'value = ["secret-marker",', "toml_syntax", "end of document"),
+        ("rpacore.toml", '[project]\n', "invalid_shape", None),
+        ("rpacore.toml", 'secret-marker = 1\n', "invalid_shape", None),
+        ("rpacore.toml", 'project = "secret-marker"\n', "invalid_type", None),
+        ("rpacore.toml", '[project]\nentrypoint = "secret-marker"\n[storage]\ntransaction_db_path = "x.db"\n', "invalid_value", None),
+        ("config.toml", 'queue = "secret-marker"\n', "invalid_type", None),
+        ("config.toml", 'max_retries = "secret-marker"\n', "invalid_type", None),
+        ("config.toml", 'log_format = "secret-marker"\n', "invalid_value", None),
+        ("config.toml", '[queue]\ndb_path = ":memory:"\n', "invalid_value", None),
+    ])
+    def test_expected_input_errors_are_safe_and_actionable(self, tmp_path, filename, source, cause, location):
+        if location == "end of document":
+            with pytest.raises(tomllib.TOMLDecodeError) as parsed:
+                tomllib.loads(source)
+            if type(getattr(parsed.value, "lineno", None)) is int and type(getattr(parsed.value, "colno", None)) is int:
+                # This named case is one line, with the error immediately after its last byte.
+                location = f"line 1, column {len(source) + 1}"
+        project = write_project(tmp_path, "raise RuntimeError('must not import')\n")
+        (project / filename).write_text(source, encoding="utf-8")
+        before = {p: p.read_bytes() for p in project.iterdir() if p.is_file()}
+        result = run_cli("doctor", "--json", cwd=project)
+        assert result.returncode == 1 and result.stderr == ""
+        checks = {c["id"]: c for c in json.loads(result.stdout)["checks"]}
+        check = checks["project.manifest" if filename == "rpacore.toml" else "project.config"]
+        expected = {"cause": cause}
+        if location is not None:
+            expected["location"] = location
+        assert check["details"] == expected
+        human = run_cli("doctor", cwd=project)
+        assert human.returncode == 1 and cause in human.stdout and "check the file" in human.stdout
+        if location:
+            assert location in human.stdout
+        assert "secret-marker" not in result.stdout + human.stdout
+        assert {p: p.read_bytes() for p in project.iterdir() if p.is_file()} == before
+
+    def test_parser_location_attributes_and_unknown_suffix_are_bounded(self):
+        # Python 3.11/3.12 use suffixes; newer parsers can expose numeric attributes.
+        exc = tomllib.TOMLDecodeError("secret-marker (unfamiliar location)")
+        assert input_error_details(exc) == {"cause": "toml_syntax"}
+        exc.lineno, exc.colno = 4, 8
+        assert input_error_details(exc) == {"cause": "toml_syntax", "location": "line 4, column 8"}
+        assert input_error_details(RuntimeError("secret-marker")) == {"cause": "unexpected"}
+
+    @pytest.mark.parametrize("path", ["", ":memory:", "invalid\x00path"])
+    def test_invalid_discovered_database_paths_are_not_absence(self, tmp_path, monkeypatch, path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(doctor_module, "_discover_manifest", lambda: (None, []))
+        monkeypatch.setattr(doctor_module, "_discover_config", lambda **kwargs: ({"queue": {"db_path": path}}, []))
+        result = collect_doctor_result()
+        schema = next(c for c in result.checks if c.id == "queue.schema")
+        assert schema.status == "fail" and schema.details == {}
+
+    def test_nonregular_database_is_rejected_before_open(self, tmp_path, monkeypatch):
+        from types import SimpleNamespace
+        path = tmp_path / "pipe.db"
+        real_stat = Path.stat
+        def nonregular(candidate, **kwargs):
+            if candidate == path:
+                return SimpleNamespace(st_mode=stat.S_IFIFO)
+            return real_stat(candidate, **kwargs)
+        def must_not_open(*args, **kwargs):
+            raise AssertionError("Nonregular database must not be opened")
+        monkeypatch.setattr(Path, "stat", nonregular)
+        monkeypatch.setattr(Path, "open", must_not_open)
+        with pytest.raises(OSError, match="not a regular file"):
+            doctor_module._database_header_journal_mode(str(path), field="test")
+
+    @pytest.mark.parametrize("exception", [PermissionError("private-marker"), RuntimeError("private-marker")])
+    def test_config_stat_failures_remain_bounded(self, tmp_path, monkeypatch, exception):
+        path = tmp_path / "config.toml"
+        real_stat = Path.stat
+        def fail_stat(candidate, **kwargs):
+            if candidate == path:
+                raise exception
+            return real_stat(candidate, **kwargs)
+        monkeypatch.setattr(Path, "stat", fail_stat)
+        config, checks = doctor_module._discover_config(config_path=None, manifest_dir=tmp_path)
+        assert config is None and checks[0].status == "fail"
+        assert checks[0].details == {"cause": "unreadable" if isinstance(exception, OSError) else "unexpected"}
+        assert "private-marker" not in json.dumps(checks[0].to_dict())
+
+    @pytest.mark.parametrize("target", ["manifest", "config"])
+    def test_found_input_disappearing_is_not_no_selection(self, tmp_path, monkeypatch, target):
+        project = write_project(tmp_path, "raise RuntimeError('must not import')\n")
+        (project / "config.toml").write_text("", encoding="utf-8")
+        monkeypatch.chdir(project)
+        def disappeared(*args, **kwargs):
+            raise FileNotFoundError("private-marker")
+        monkeypatch.setattr(doctor_module, "load_project_manifest" if target == "manifest" else "load_config", disappeared)
+        result = collect_doctor_result()
+        check = next(c for c in result.checks if c.id == f"project.{target}")
+        assert check.status == "fail" and check.details == {"cause": "unreadable"}
+
+    def test_missing_explicit_config_fails(self, tmp_path):
+        result = run_cli("doctor", "--config", str(tmp_path / "missing.toml"), "--json", cwd=tmp_path)
+        assert result.returncode == 1
+        check = next(c for c in json.loads(result.stdout)["checks"] if c["id"] == "project.config")
+        assert check["details"] == {"cause": "unreadable"}
+
     def test_unexpected_collection_error_is_bounded(self, monkeypatch, capsys) -> None:
         def raise_unexpected_error(**_kwargs: object) -> object:
             raise RuntimeError("unexpected diagnostic failure")
@@ -219,6 +456,8 @@ class TestCliDoctor:
         checks = {check["id"]: check for check in payload["checks"]}
         assert checks["runtime.python"]["status"] == "pass"
         assert checks["project.manifest"]["status"] == "not_applicable"
+        assert checks["transactions.schema"]["details"] == {}
+        assert checks["queue.schema"]["details"] == {}
 
     def test_transaction_database_is_inspected_without_mutation(self, tmp_path: Path) -> None:
         db_path = tmp_path / "transactions.db"
@@ -377,6 +616,7 @@ class TestCliDoctor:
         checks = {check.id: check for check in result.checks}
         assert checks["transactions.journal"].status == "warning"
         assert checks["transactions.schema"].status == "not_applicable"
+        assert checks["transactions.schema"].details == {}
         assert checks["transactions.quick_check"].status == "not_applicable"
 
     def test_malformed_foreign_key_is_a_structured_json_failure(self, tmp_path: Path) -> None:
@@ -456,6 +696,21 @@ class TestCliDoctor:
 
 
 class TestCliTransaction:
+    @pytest.mark.parametrize("command", [("list", "--json"), ("show", "missing", "--json"), ("export", "--format", "json")])
+    @pytest.mark.parametrize("manifest", [None, 'value = ["private-marker",'])
+    def test_resolution_errors_have_no_empty_database_prefix(self, tmp_path, command, manifest):
+        if manifest is not None:
+            (tmp_path / "rpacore.toml").write_text(manifest, encoding="utf-8")
+        result = run_cli("transaction", *command, cwd=tmp_path)
+        assert result.returncode == 1 and result.stdout == ""
+        assert "Could not resolve transaction database" in result.stderr
+        assert result.stderr.lower().count("could not resolve transaction database") == 1
+        assert "pass --db" in result.stderr and "in :" not in result.stderr
+        selected = tmp_path / "missing.db"
+        result = run_cli("transaction", *command, "--db", str(selected), cwd=tmp_path)
+        assert result.returncode == 1 and result.stdout == ""
+        assert str(selected) in result.stderr and not selected.exists()
+
     def test_transaction_resume_is_not_a_cli_command(self, tmp_path: Path) -> None:
         result = run_cli("transaction", "resume", cwd=tmp_path)
 

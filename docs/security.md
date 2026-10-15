@@ -149,6 +149,19 @@ not import a project entrypoint. Treat its bounded runtime and database-health
 output as operational metadata and keep it within the same trusted support
 boundary as the project.
 
+Doctor input failures expose only fixed cause codes and recognized TOML
+line/column or end-of-document locations, without source excerpts or offending
+values. Missing discovered databases are unchecked, not evidence of intact
+storage: verify the configured location and recovery/backup before running work
+that could recreate a removed database.
+
+New generated greeting projects persist absolute output paths in step arguments,
+state, and artifacts. Inspection/exports may expose local account and directory
+names. Copied records keep the original output destination when resumed; moving
+the project changes only the destination computed by a fresh run. The single
+greeting file is replaceable output, not retained historical content. Atomic
+replacement does not make file publication and SQLite persistence one commit.
+
 ## Security Review Checklist
 
 Use this checklist for changes that touch security-sensitive surfaces:

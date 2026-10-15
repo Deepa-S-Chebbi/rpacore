@@ -26,6 +26,21 @@ All notable user-facing changes are recorded here.
 
 ### Fixed
 
+- `doctor` treats only absent discovered transaction/queue storage as unchecked
+  `not_applicable`, including queue paths from explicit `--config`. Direct DB
+  flags still fail on absence; an absent/invalid explicit config also fails.
+  Verify configured locations and recovery/backup before recreating storage.
+  Format v1 adds optional bounded `reason`, `cause`, and TOML `location` details;
+  input errors omit offending values/source excerpts. Transaction inspection
+  resolution errors no longer announce an empty database path.
+- Future scaffolds use `generated-greeting/v2` and atomically replace one
+  project-root greeting file, including nested runs and same-ID replay after
+  publication failure. Persisted output arguments/state/artifacts expose absolute
+  local paths; copied records keep their original destination, while a fresh run
+  uses the current project root. Existing v1 projects need no migration and
+  cannot be resumed with the v2 definition. Python APIs, SQLite and transaction/
+  export schemas, and dependencies are unchanged.
+
 - HTML reports and email HTML now render unsafe or ambiguous screenshot paths
   as escaped text. Local screenshot paths remain clickable, with Windows drive
   paths converted to local file URLs and filename delimiters encoded. Explicit

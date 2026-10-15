@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import runpy
 import subprocess
 import sys
 import textwrap
@@ -14,7 +15,7 @@ from pathlib import Path
 import pytest
 
 import rpacore.cli as cli_module
-from rpacore import HistoryEvent, Status, list_transactions
+from rpacore import HistoryEvent, ProcessContext, Status, Transaction, list_transactions
 from tests.cli_helpers import REPO_ROOT, run_cli
 
 
@@ -99,7 +100,7 @@ class TestGeneratedProject:
         transactions = list_transactions(str(project / "rpacore.db"))
         assert len(transactions) == 1
         assert transactions[0].status is Status.SUCCESSFUL
-        assert transactions[0].definition_identity == "generated-greeting/v1"
+        assert transactions[0].definition_identity == "generated-greeting/v2"
         assert HistoryEvent.STEP_SUCCEEDED in [
             entry.event for entry in transactions[0].history
         ]
@@ -131,6 +132,13 @@ class TestGeneratedProject:
             assert inspection.returncode == 0, inspection.stderr
             saved = json.loads(inspection.stdout)["transaction"]
             assert saved["id"] == transaction_id and saved["status"] == "successful"
+            destination = str(project / "greeting.txt")
+            assert saved["definition_identity"] == "generated-greeting/v2"
+            assert saved["steps"][0]["arguments"]["output_path"] == destination
+            assert saved["state"]["greeting_path"] == destination
+            assert saved["artifacts"][0]["path"] == destination
+            assert Path(saved["artifacts"][0]["path"]).read_bytes() == b"Hello, Alice\n"
+            assert not (nested / "greeting.txt").exists()
             ids.append(transaction_id)
             assert "Alice" not in result.stdout and "greeting.txt" not in result.stdout
             if level == "ERROR":
@@ -154,6 +162,104 @@ class TestGeneratedProject:
                 json.loads(line)
         assert len(set(ids)) == 2
         assert {tx.id for tx in list_transactions(str(project / "rpacore.db"))} == set(ids)
+
+    @pytest.mark.parametrize("relative", [False, True])
+    def test_generated_writer_failure_preserves_destination_and_metadata(self, tmp_path, monkeypatch, relative):
+        project = tmp_path / "parent with spaces" / "demo"
+        assert run_cli("init", str(project), cwd=tmp_path).returncode == 0
+        nested = project / "nested"
+        nested.mkdir()
+        monkeypatch.chdir(nested)
+        greeting = runpy.run_path(str(project / "steps" / "greeting.py"))["WriteGreeting"]
+        output = project / "greeting.txt"
+        output.write_bytes(b"previous greeting")
+        step = greeting(name="write_greeting", execution_order=1, arguments={
+            "name": "Alice", "output_path": "greeting.txt" if relative else str(output),
+        })
+        transaction = Transaction(reference="writer-failure", steps=[step])
+        real_write = Path.write_text
+        def partial_write(path, content, **kwargs):
+            real_write(path, "partial", **kwargs)
+            raise OSError("controlled-writer-failure")
+        with monkeypatch.context() as patch:
+            patch.setattr(Path, "write_text", partial_write)
+            with pytest.raises(OSError, match="controlled-writer-failure"):
+                step.execute(ProcessContext(transaction=transaction))
+        assert output.read_bytes() == b"previous greeting"
+        assert transaction.state == {} and transaction.artifacts == []
+        assert not list(project.glob(".greeting.txt.*.tmp"))
+        assert not (nested / "greeting.txt").exists()
+        step.execute(ProcessContext(transaction=transaction))
+        assert output.read_bytes() == b"Hello, Alice\n"
+        assert transaction.state["greeting_path"] == str(output)
+        assert transaction.artifacts[0].path == str(output)
+
+    def test_generated_post_publication_failure_and_same_id_replay(self, tmp_path):
+        project = tmp_path / "parent with spaces" / "demo"
+        assert run_cli("init", str(project), cwd=tmp_path).returncode == 0
+        step_path = project / "steps" / "greeting.py"
+        source = step_path.read_text(encoding="utf-8")
+        step_path.write_text(source + textwrap.dedent('''
+            from contextlib import contextmanager
+            real_atomic_output_path = atomic_output_path
+            @contextmanager
+            def atomic_output_path(destination):
+                with real_atomic_output_path(destination) as temporary:
+                    yield temporary
+                raise RuntimeError("controlled-post-publication-failure")
+            '''), encoding="utf-8")
+        failed = run_cli("run", cwd=project)
+        assert failed.returncode == 1
+        transaction_id = parse_generated_receipt(failed.stdout, project, "failed")
+        inspection = run_cli("transaction", "show", transaction_id, "--json", cwd=project)
+        assert inspection.returncode == 0, inspection.stderr
+        saved = json.loads(inspection.stdout)["transaction"]
+        assert saved["status"] == "failed" and saved["steps"][0]["status"] == "failed"
+        assert saved["steps"][0]["exceptions"][-1]["type"] == "system"
+        assert saved["steps"][0]["exceptions"][-1]["message"] == "controlled-post-publication-failure"
+        assert saved["state"] == {} and saved["artifacts"] == []
+        destination = project / "greeting.txt"
+        before = destination.read_bytes()
+        assert before == b"Hello, Alice\n"
+        # Fresh process imports the original generated step, without the injected fault.
+        step_path.write_text(source, encoding="utf-8")
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        replay = textwrap.dedent('''
+            import sys
+            from pathlib import Path
+            from rpacore import Engine, execute_transaction, resume_transaction, Status
+            project = Path(sys.argv[1])
+            sys.path.insert(0, str(project))
+            from steps.greeting import WriteGreeting
+            tx = resume_transaction(sys.argv[2], [WriteGreeting(
+                name="write_greeting", execution_order=1,
+                arguments={"name": "different", "output_path": str(Path.cwd() / "wrong.txt")},
+            )], db_path=str(project / "rpacore.db"), definition_identity="generated-greeting/v2")
+            assert tx.id == sys.argv[2]
+            assert tx.steps[0].arguments == {"name": "Alice", "output_path": str(project / "greeting.txt")}
+            execute_transaction(tx, engine=Engine(), transaction_db_path=str(project / "rpacore.db"))
+            assert tx.status is Status.SUCCESSFUL
+            assert not Path("wrong.txt").exists()
+            ''')
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(REPO_ROOT)
+        result = subprocess.run([sys.executable, "-c", replay, str(project), transaction_id],
+                                cwd=elsewhere, env=env, capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        assert destination.read_bytes() == before
+        inspection = run_cli("transaction", "show", transaction_id, "--db",
+                             str(project / "rpacore.db"), "--json", cwd=elsewhere)
+        assert inspection.returncode == 0, inspection.stderr
+        final = json.loads(inspection.stdout)["transaction"]
+        assert final["id"] == transaction_id and final["status"] == "successful"
+        assert final["steps"][0]["status"] == "successful"
+        assert final["state"]["greeting_path"] == str(destination)
+        assert final["artifacts"][0]["path"] == str(destination)
+        assert len(list_transactions(str(project / "rpacore.db"))) == 1
+        assert list(project.rglob("greeting.txt")) == [destination]
+        assert not list(project.glob(".greeting.txt.*.tmp"))
+        assert not list(elsewhere.iterdir())
 
     @pytest.mark.parametrize("failure", ["business", "system"])
     def test_generated_failure_receipt_matches_saved_outcome(self, tmp_path: Path, failure: str) -> None:
