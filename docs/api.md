@@ -244,3 +244,8 @@ summary prose is for people rather than semantic parsing.
 | Symbol | Purpose | Side effects |
 | --- | --- | --- |
 | `Artifact`, `HistoryEntry`, `HistoryEvent` | Durable records attached to transactions. | No I/O. Artifact records store paths and metadata, not file contents. |
+
+The [CLI inspection surface](cli.md#machine-readable-compatibility) exposes the
+existing query filters and stored outcomes without changing `TransactionSummary`
+or the query API. For executable same-ID recovery with persisted arguments, see
+the [tutorial](tutorial.md#same-id-recovery-from-a-disposable-scaffold).

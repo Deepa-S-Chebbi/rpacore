@@ -60,7 +60,8 @@ original error. An in-memory successful status or completion log can precede
 a failed final save; inspect the database before deciding how to recover.
 Inspection may find no record or an earlier checkpoint. A second plain
 `rpacore run` starts a new transaction with a new ID; it does not resume the
-previous record.
+previous record. For application-owned same-ID continuation, follow the
+[disposable recovery recipe](tutorial.md#same-id-recovery-from-a-disposable-scaffold).
 
 `SystemExit` and `KeyboardInterrupt` propagate directly without a generated
 receipt or abort diagnostic. An exit code alone does not confirm persistence;
@@ -190,24 +191,92 @@ rpacore transaction export --format json
 rpacore transaction export --format ndjson
 ```
 
-`transaction list` returns the latest 100 transactions by default. Use
-`--limit N` to choose a different cap.
+`transaction list` returns the latest 100 selected summaries by default.
+`--limit N` accepts any positive cap, including values above 1,000; each query
+fetches at most 1,000 summaries before loading full records read-only.
+
+List options:
+
+| Option | Meaning |
+| --- | --- |
+| `--status VALUE` | Repeat for a union of `pending`, `in_progress`, `successful`, `failed`, `skipped`. |
+| `--since TIME`, `--until TIME` | Inclusive ISO-8601 creation bounds with an offset or `Z`; normalized to UTC. |
+| `--reference TEXT` | Exact reference. |
+| `--metadata KEY=JSON` | Repeat for exact top-level metadata matches; JSON types remain distinct. |
+| `--run-id TEXT` | Shorthand for the string-valued `run_id` metadata match. Creates no run ID or grouping entity. |
+| `--cursor TOKEN` | Continue the same filters from the previous page. |
+
+Different filters combine with AND. Repeated metadata keys are usage errors,
+including repeated `--run-id` or `run_id` supplied through both `--metadata` and
+`--run-id`.
+`--run-id example` and `--metadata 'run_id="example"'` share cursor semantics.
+In PowerShell, quote the entire `KEY=JSON` argument so the JSON reaches the CLI
+unchanged. Naive/invalid timestamps, inverted windows, invalid statuses and
+non-JSON-safe metadata return `2` before storage access; validation diagnostics
+omit metadata values. Invalid/changed-filter cursors and storage, record or
+serialization failures return `1` with diagnostics on stderr and no partial
+JSON stdout. Normal completion returns `0`.
+
+```bash
+rpacore transaction list --run-id example --status failed --limit 20 --json
+rpacore transaction list --run-id example --status failed --limit 20 --cursor TOKEN --json
+rpacore transaction list --since 2026-10-15T09:00:00-03:00 --until 2026-10-15T12:00:00Z
+rpacore transaction export --transaction-id ID --format json
+```
+
+Human list/show display the captured outcome category, retry disposition, and
+failure code (including `unknown` and an empty code). These values are read
+from the transaction, never inferred from its last step or exception text. A
+failed transaction can contain a later successful step. `--run-id` is only an
+exact match against application metadata; applications choose their own values.
+Human continuation instructions apply whether the database was selected with
+`--db` or resolved from the project manifest.
 
 ### Machine-readable compatibility
 
-The `--json` list and show envelopes are independently versioned by their
-`command` and `schema_version` fields. Their version-2 framework-owned fields
-are closed: a field cannot be added, removed, renamed, retyped, or given a new
-meaning without a new schema version. The nested transaction is separately
-versioned by `transaction_format_version`. Export follows the corresponding
-version rules in the [Export Format Reference](export-format.md).
+List and show now emit `schema_version: 3` to expose stored outcome truth
+without changing the closed canonical transaction-v3 record. These framework
+fields are closed and independently versioned from the nested transaction:
+
+```json
+{
+  "schema_version": 3,
+  "command": "transaction:list",
+  "limit": 100,
+  "transactions": [],
+  "has_more": false,
+  "next_cursor": null
+}
+```
+
+Each list entry has exactly `transaction` (canonical transaction-v3) and
+`outcome` (`category`, `retry_disposition`, `failure_code`, all strings).
+Show has exactly `schema_version`, `command` (`transaction:show`), `transaction`,
+and `outcome` with the same meanings. Consumers migrating from CLI v2 must check
+`schema_version`, unwrap list entries as `entry.transaction` instead of treating
+entries as transaction records, keep show access at `payload.transaction`, and
+read the new outcome beside the record. There is no compatibility-mode flag.
+SQLite schema 10, query/cursor-v1, transaction-v3, export-v2, and report-v2 remain
+unchanged; this CLI consumer migration requires no database migration.
+
+Continue using the same filters and the returned `next_cursor` while
+`has_more` is true. Human list output supplies the token and continuation
+instructions. Selected summaries count against `--limit`; concurrent cleanup
+can shorten the rendered list, without refilling it or building a cursor from
+rendered records. Null/naive legacy creation times sort after timestamped rows
+and do not match time windows. Pages are current reads, not one global snapshot.
 
 Human output is for operators. `--json` and `export` output are parseable on
-stdout; diagnostics go to stderr. List and export select records through the
-same normalized-UTC cursor pages as `query_transactions()`. Export keeps only
-one page of summary records at a time, so it does not retain an unbounded
-identifier snapshot or hold a SQLite read lock against checkpoints. Inserts
-before the current cursor do not appear later; inserts after it can appear in a
-later export page. A selected transaction deleted by concurrent cleanup before
-its record is loaded is omitted by both list and export. Export has no
-transaction-list cap and walks additional pages as needed.
+stdout; diagnostics go to stderr. List and all-record export select records
+through the same normalized-UTC cursor pages as `query_transactions()`. Queries
+release their connections before full-record loads, avoiding an inspection-wide
+read lock against checkpoints. Inserts before the cursor do not appear later;
+inserts after it can appear in a later page. A selected summary deleted before
+its record load is omitted. All-record export has no list cap.
+
+`transaction export --transaction-id ID` loads exactly that ID read-only.
+Blank/whitespace-only IDs return `2` before storage access; other IDs are passed
+unchanged. A missing/deleted ID or unavailable/incompatible database returns `1`
+with empty stdout; it never falls back to all records or a successful empty
+export. Both JSON and NDJSON retain export format v2. See the
+[Export Format Reference](export-format.md) for buffering and sensitive data.

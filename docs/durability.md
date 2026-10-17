@@ -421,6 +421,13 @@ explicitly resets both the stopping failure and its causal downstream skips to
 Repeated resume calls do not append duplicate `transaction_resumed` history
 entries when the latest persisted history entry already records the resume.
 
+For a runnable application with a completed step, a publication failure, and a
+separate same-ID resume process, follow the
+[tutorial recovery recipe](tutorial.md#same-id-recovery-from-a-disposable-scaffold).
+Persisted step arguments replace fresh constructor arguments during recovery.
+Atomic artifact publication and SQLite checkpoints are separate commits;
+application effects must tolerate replay across that gap.
+
 ## Transaction Persistence
 
 Transaction history is written through:
@@ -443,7 +450,11 @@ inserts after it can appear in a later page. Updates to an already selected
 transaction are visible if they commit before that individual record is loaded;
 a selected transaction deleted by concurrent cleanup before its load is omitted.
 This avoids a long-lived SQLite read lock and retains only one summary page at a
-time. Export has no transaction-list cap and walks additional pages as needed.
+time. List continuation counts selected summaries, even if cleanup removes
+records before load, and retains the last consumed summary page's cursor.
+All-record export has no transaction-list cap and walks additional pages as needed.
+Single-ID export instead fails if that record is missing; it never exports
+other transactions. See the [CLI reference](cli.md#transaction-commands).
 `list_transactions()` remains the compatible full-record API with its existing
 bounded snapshot behavior.
 

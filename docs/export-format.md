@@ -7,6 +7,28 @@ rpacore transaction export --format json
 rpacore transaction export --format ndjson
 ```
 
+## Selecting One Transaction
+
+Add `--transaction-id ID` to either format to export exactly one record from
+an existing database; use `--db PATH` when outside the selected project.
+
+```bash
+rpacore transaction export --db path/to/rpacore.db --transaction-id ID --format json
+rpacore transaction export --db path/to/rpacore.db --transaction-id ID --format ndjson
+```
+
+JSON contains one canonical transaction-v3 entry; NDJSON contains one line.
+Export remains v2 with no new envelope field. Blank/whitespace-only IDs are
+usage errors (`2`) before storage access; other IDs are passed unchanged.
+A missing/deleted selected record or unavailable/incompatible database fails
+(`1`) with diagnostics on stderr and empty stdout, never an all-record fallback
+or successful empty export. Without this option, the uncapped all-record
+traversal below is unchanged. Both paths buffer serialization before publishing
+stdout, so record/serialization failures publish no partial export.
+
+Canonical exports do not include captured outcome projections; use report-v2
+or [CLI list/show v3](cli.md#machine-readable-compatibility) for that truth.
+
 ## JSON
 
 JSON export writes one envelope:
@@ -39,7 +61,7 @@ add new framework-owned fields to an existing export or transaction version.
 
 ## Iteration Consistency
 
-Export selects records through normalized-UTC cursor pages in `created_at DESC,
+Without `--transaction-id`, export selects records through normalized-UTC cursor pages in `created_at DESC,
 id ASC` order. It keeps one page of summaries at a time and releases the page
 query before loading records, so slow output or partial consumption does not
 hold a SQLite read lock against concurrent checkpoints. Inserts before the

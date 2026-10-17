@@ -7,31 +7,20 @@ import json
 import re
 import shutil
 import sys
-import tempfile
 import threading
-from collections.abc import Callable, Iterable, Iterator, Sequence
-from datetime import datetime, timezone
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from rpacore import __version__
 from rpacore._scaffold import _write_project_files
+from rpacore._transaction_cli import _inspect_transactions
 from rpacore.doctor import collect_doctor_result
-from rpacore.exceptions import BusinessException
 from rpacore.manifest import load_project_manifest, resolve_project_entrypoint
-from rpacore.persistence import load_transaction, query_transactions
-from rpacore.serialization import serialize_transaction
-from rpacore.transaction import Transaction
 
 
 USAGE_ERROR = 2
 EXECUTION_ERROR = 1
 SUCCESS = 0
-CLI_TRANSACTION_SCHEMA_VERSION = 2
-EXPORT_FORMAT_VERSION = 2
-_NDJSON_EXPORT_KEYS = frozenset(
-    {"export_format_version", "framework_version", "exported_at"}
-)
-_QUERY_PAGE_SIZE = 1_000
 _ENTRYPOINT_PATH_LOCK = threading.RLock()
 
 
@@ -66,6 +55,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum transactions to list. Defaults to 100.",
     )
 
+    list_parser.add_argument("--status", action="append", default=[], help="Status to include; repeat for a union.")
+    list_parser.add_argument("--since", help="Inclusive ISO-8601 creation time with offset or Z.")
+    list_parser.add_argument("--until", help="Inclusive ISO-8601 creation time with offset or Z.")
+    list_parser.add_argument("--reference", help="Exact transaction reference.")
+    list_parser.add_argument("--metadata", action="append", default=[], metavar="KEY=JSON", help="Exact top-level metadata match; repeat for different keys.")
+    list_parser.add_argument("--run-id", action="append", default=[], help="Exact string metadata match for run_id; use once.")
+    list_parser.add_argument("--cursor", help="Continue with the same filters.")
+
     show_parser = transaction_subparsers.add_parser(
         "show",
         help="Show one persisted transaction.",
@@ -79,6 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Export persisted transactions as JSON or NDJSON.",
     )
     export_parser.add_argument("--db", dest="db_path", help="Transaction database path.")
+    export_parser.add_argument("--transaction-id", help="Export exactly one persisted transaction.")
     export_parser.add_argument(
         "--format",
         choices=("json", "ndjson"),
@@ -197,63 +195,6 @@ def _init_project(project_dir: Path) -> int:
     return SUCCESS
 
 
-def _inspect_transactions(args: argparse.Namespace) -> int:
-    try:
-        db_path = _transaction_db_path(args.db_path)
-    except Exception as exc:
-        _print_error(str(exc))
-        return EXECUTION_ERROR
-    try:
-        if args.transaction_command == "list":
-            transactions = list(_iter_queried_transactions(db_path, limit=args.limit))
-            if args.json:
-                _write_json(
-                    {
-                        "schema_version": CLI_TRANSACTION_SCHEMA_VERSION,
-                        "command": "transaction:list",
-                        "limit": args.limit,
-                        "transactions": [
-                            serialize_transaction(tx)
-                            for tx in transactions
-                        ],
-                    }
-                )
-            else:
-                _write_transaction_list(transactions, limit=args.limit)
-            return SUCCESS
-        if args.transaction_command == "show":
-            transaction = load_transaction(
-                args.transaction_id,
-                db_path,
-                readonly=True,
-            )
-            if args.json:
-                _write_json(
-                    {
-                        "schema_version": CLI_TRANSACTION_SCHEMA_VERSION,
-                        "command": "transaction:show",
-                        "transaction": serialize_transaction(transaction),
-                    }
-                )
-            else:
-                _write_transaction_detail(transaction)
-            return SUCCESS
-        if args.transaction_command == "export":
-            export_transactions = _iter_queried_transactions(db_path)
-            _write_transaction_export(export_transactions, export_format=args.format)
-            return SUCCESS
-        raise ValueError(f"Unsupported transaction command: {args.transaction_command}")
-    except KeyError as exc:
-        _print_error(str(exc.args[0] if exc.args else exc))
-        return EXECUTION_ERROR
-    except TypeError as exc:
-        _print_error(str(exc))
-        return EXECUTION_ERROR
-    except Exception as exc:
-        _print_error(f"Could not inspect transactions in {db_path}: {exc}")
-        return EXECUTION_ERROR
-
-
 def _run_doctor(args: argparse.Namespace) -> int:
     """Run bounded readonly diagnostics without importing project entrypoints."""
     try:
@@ -274,158 +215,8 @@ def _run_doctor(args: argparse.Namespace) -> int:
     return result.exit_code
 
 
-def _iter_queried_transactions(
-    db_path: str,
-    *,
-    limit: int | None = None,
-) -> Iterator[Transaction]:
-    """Yield full records selected through the versioned summary-page query."""
-    cursor = None
-    remaining = limit
-    while remaining is None or remaining > 0:
-        page_limit = _QUERY_PAGE_SIZE if remaining is None else min(_QUERY_PAGE_SIZE, remaining)
-        page = query_transactions(db_path, cursor=cursor, limit=page_limit)
-        for summary in page.transactions:
-            try:
-                yield load_transaction(summary.id, db_path, readonly=True)
-            except KeyError:
-                # A concurrently cleaned-up record cannot be rendered after it
-                # was selected by the page query.
-                continue
-        if not page.has_more:
-            return
-        cursor = page.next_cursor
-        remaining = None if remaining is None else remaining - len(page.transactions)
-
-
-def _transaction_db_path(db_path: str | None) -> str:
-    if db_path is not None:
-        return db_path
-    try:
-        return load_project_manifest().transaction_db_path
-    except Exception as exc:
-        raise RuntimeError(
-            f"Could not resolve transaction database from rpacore.toml; pass --db: {exc}"
-        ) from exc
-
-
-def _write_transaction_list(transactions: list[Transaction], *, limit: int) -> None:
-    print(f"Showing up to {limit} transactions.")
-    if not transactions:
-        print("No transactions found.")
-        return
-    print("ID                                   STATUS       REFERENCE")
-    for transaction in transactions:
-        print(
-            f"{transaction.id:<36} {str(transaction.status):<12} {transaction.reference}"
-        )
-
-
-def _write_transaction_detail(transaction: Transaction) -> None:
-    print(f"ID:          {transaction.id}")
-    print(f"Reference:   {transaction.reference}")
-    print(f"Definition:  {transaction.definition_identity or '(unidentified)'}")
-    print(f"Status:      {transaction.status}")
-    print(f"Retries:     {transaction.retry_count}")
-    print(f"Created:     {_format_optional_datetime(transaction.created_at)}")
-    print(f"Started:     {_format_optional_datetime(transaction.started_at)}")
-    print(f"Finished:    {_format_optional_datetime(transaction.finished_at)}")
-    print(f"Steps:      {len(transaction.steps)}")
-    for step in transaction.ordered_steps():
-        print(f"  {step.execution_order}. {step.name}: {step.status}")
-        for exc in step.exceptions:
-            print(f"     - {_exception_kind(exc)}: {exc}")
-    print(f"History:     {len(transaction.history)}")
-    for entry in transaction.history:
-        step_label = "" if not entry.step_name else f" step={entry.step_name}"
-        print(
-            f"  {entry.sequence}. {entry.event} status={entry.status} "
-            f"retry={entry.retry_number}{step_label}"
-        )
-    print(f"Artifacts:   {len(transaction.artifacts)}")
-    for artifact in transaction.artifacts:
-        kind = "" if not artifact.kind else f" ({artifact.kind})"
-        print(f"  {artifact.name}{kind}: {artifact.path}")
-    print(f"Metadata:    {len(transaction.metadata)} keys")
-
-
 def _write_json(data: dict[str, object]) -> None:
     print(json.dumps(data, sort_keys=True, separators=(",", ":")))
-
-
-def _write_transaction_export(
-    transactions: Iterable[Transaction],
-    *,
-    export_format: str,
-) -> None:
-    exported_at = _utc_now().isoformat()
-    with tempfile.TemporaryFile("w+", encoding="utf-8", newline="\n") as output:
-        if export_format == "json":
-            output.write("{")
-            output.write(
-                _json_field("export_format_version", EXPORT_FORMAT_VERSION)
-            )
-            output.write(",")
-            output.write(_json_field("exported_at", exported_at))
-            output.write(",")
-            output.write(_json_field("framework_version", __version__))
-            output.write(',"transactions":[')
-            first = True
-            for transaction in transactions:
-                if not first:
-                    output.write(",")
-                first = False
-                output.write(
-                    json.dumps(
-                        serialize_transaction(transaction),
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    )
-                )
-            output.write("]}")
-        else:
-            for transaction in transactions:
-                record = serialize_transaction(transaction)
-                _raise_for_ndjson_export_key_collision(record)
-                export_record = {
-                    **record,
-                    "export_format_version": EXPORT_FORMAT_VERSION,
-                    "framework_version": __version__,
-                    "exported_at": exported_at,
-                }
-                output.write(
-                    json.dumps(export_record, sort_keys=True, separators=(",", ":"))
-                )
-                output.write("\n")
-        output.seek(0)
-        shutil.copyfileobj(output, sys.stdout)
-
-
-def _raise_for_ndjson_export_key_collision(record: dict[str, object]) -> None:
-    collisions = sorted(_NDJSON_EXPORT_KEYS.intersection(record))
-    if collisions:
-        keys = ", ".join(collisions)
-        raise RuntimeError(f"transaction export record key collision: {keys}")
-
-
-def _json_field(key: str, value: object) -> str:
-    return (
-        json.dumps(key, sort_keys=True, separators=(",", ":"))
-        + ":"
-        + json.dumps(value, sort_keys=True, separators=(",", ":"))
-    )
-
-
-def _exception_kind(exc: BaseException) -> str:
-    return "business" if isinstance(exc, BusinessException) else "system"
-
-
-def _format_optional_datetime(value: datetime | None) -> str | None:
-    return None if value is None else value.isoformat()
-
-
-def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
 
 
 def _positive_int(value: str) -> int:

@@ -246,6 +246,175 @@ rpacore run
 rpacore transaction list
 ```
 
+## Same-ID Recovery From A Disposable Scaffold
+
+Start in a new disposable project, never an established application:
+
+```powershell
+rpacore init recovery-demo
+cd recovery-demo
+python -m build --no-isolation --wheel
+python -m pytest tests/test_greeting_step.py -q
+rpacore doctor
+```
+
+Use an environment with RPA Core, `build`, `setuptools`, `wheel`, and `pytest`
+already installed. This extends the generated greeting with a completed
+preparation step; the default scaffold itself stays unchanged. Save this as
+`recovery.py` in the project root:
+
+<!-- recovery-file: recovery.py -->
+```python
+import argparse
+from pathlib import Path
+
+from rpacore import (
+    Engine, ProcessContext, Status, Step, Transaction, atomic_output_path,
+    execute_transaction, generate_report, render_json, resume_transaction,
+)
+from steps.greeting import WriteGreeting
+
+DEFINITION = "tutorial-greeting/v1"
+
+
+class PrepareGreeting(Step):
+    def execute(self, ctx: ProcessContext) -> None:
+        ctx.state["preparation_count"] = ctx.optional_state("preparation_count", int, 0) + 1
+
+
+def steps(project: Path, *, resuming: bool) -> list[Step]:
+    return [
+        PrepareGreeting("prepare_greeting", 1),
+        WriteGreeting("write_greeting", 2, arguments={
+            "name": "different" if resuming else "Alice",
+            "output_path": str(project / ("wrong.txt" if resuming else "greeting.txt")),
+        }),
+    ]
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("project", type=Path)
+    parser.add_argument("database", type=Path)
+    parser.add_argument("--resume", metavar="TRANSACTION_ID")
+    args = parser.parse_args()
+    project = args.project.resolve()
+    database = str(args.database.resolve())
+    if args.resume is None:
+        tx = Transaction(
+            reference="recovery-greeting", definition_identity=DEFINITION,
+            metadata={"run_id": "tutorial-run"}, steps=steps(project, resuming=False),
+        )
+    else:
+        tx = resume_transaction(
+            args.resume, steps(project, resuming=True), db_path=database,
+            definition_identity=DEFINITION, retry_business_failures=False,
+        )
+    if tx.status is not Status.SUCCESSFUL:
+        execute_transaction(tx, engine=Engine(), transaction_db_path=database)
+    report_path = project / f"report-{tx.id}.json"
+    with atomic_output_path(report_path) as temporary:
+        temporary.write_text(render_json(generate_report(tx)), encoding="utf-8")
+    print(f"Transaction {tx.id}: {tx.status}")
+    print(f"Database: {database}")
+    print(f"Report: {report_path}")
+    return 0 if tx.status is Status.SUCCESSFUL else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+The extended application owns `tutorial-greeting/v1`, distinct from the
+one-step scaffold's `generated-greeting/v2`. Run once successfully to leave an
+unrelated transaction in the same database:
+
+```powershell
+python recovery.py . ./rpacore.db
+```
+
+For demonstration only, save and run `inject_demo_failure.py` below from this
+new project. It saves the original step source before injecting an ordinary
+failure after atomic publication and before state/artifact registration. This
+is a fault experiment, not application recovery logic.
+
+<!-- recovery-file: inject_demo_failure.py -->
+```python
+from pathlib import Path
+
+step_path = Path(__file__).resolve().parent / "steps" / "greeting.py"
+backup = step_path.with_suffix(".py.backup")
+with backup.open("xb") as output:
+    output.write(step_path.read_bytes())
+source = step_path.read_text(encoding="utf-8")
+step_path.write_text(source + """
+from contextlib import contextmanager
+real_atomic_output_path = atomic_output_path
+@contextmanager
+def atomic_output_path(destination):
+    with real_atomic_output_path(destination) as temporary:
+        yield temporary
+    raise RuntimeError('controlled-post-publication-failure')
+""", encoding="utf-8")
+```
+
+```powershell
+python inject_demo_failure.py
+python recovery.py . ./rpacore.db
+rpacore transaction list --run-id tutorial-run --status failed
+```
+
+The second application run exits `1`, prints its failed ID, and leaves complete
+`Hello, Alice` greeting bytes. `preparation_count` is already `1`, preparation
+is successful, and greeting is failed with no registered artifact. The file
+publication and SQLite checkpoint cannot commit together. Replaying an effect
+must be safe in the application: replacing these deterministic bytes is safe;
+blindly appending, sending mail, or charging again would need its own durable
+idempotency strategy. This is not an exactly-once guarantee.
+
+Save `restore_demo_step.py` and run it before starting the separate resume
+process. The restored application has no fault branch or monkeypatch:
+
+<!-- recovery-file: restore_demo_step.py -->
+```python
+from pathlib import Path
+
+step_path = Path(__file__).resolve().parent / "steps" / "greeting.py"
+backup = step_path.with_suffix(".py.backup")
+step_path.write_bytes(backup.read_bytes())
+backup.unlink()
+```
+
+```powershell
+python restore_demo_step.py
+$failedId = "<failed ID printed above>"
+rpacore transaction show $failedId --json
+python recovery.py . ./rpacore.db --resume $failedId
+rpacore transaction show $failedId --json
+rpacore transaction export --transaction-id $failedId --format json
+rpacore transaction export --transaction-id $failedId --format ndjson
+```
+
+Recovery restores persisted arguments: `Alice` and the original absolute output
+path win over the deliberately different fresh constructor arguments. It keeps
+the original ID, skips completed preparation, and replays greeting to identical
+bytes. No `wrong.txt` appears; state and artifact paths name `greeting.txt`.
+The report file contains that same ID and captured outcome; the exports select
+only that ID even though the database also contains the unrelated success.
+Calling the script again with the successful ID leaves the durable transaction
+unchanged. Keep the definition identity stable across this compatible fault
+removal. An incompatible identity is rejected before changing a current record.
+Moving/copying a project does not rewrite persisted output arguments.
+
+A `BusinessException` normally marks its step failed and allows later steps to
+run. For dependent work, raise `BusinessException(...,
+halts_remaining_steps=True)` so the engine records causal skips. Recovery
+preserves business failures (and those skips) by default. Only after repairing
+the cause should an application explicitly choose
+`retry_business_failures=True`; it resets the failed business work and causal
+skips for replay. A later successful step does not make the transaction's stored
+business-failure outcome successful.
+
 ## Next Steps
 
 - Add a second step with `execution_order=2`.

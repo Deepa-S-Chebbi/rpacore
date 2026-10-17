@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 import rpacore.cli as cli_module
+import rpacore._transaction_cli as transaction_cli
 import rpacore.doctor as doctor_module
 from rpacore._doctor_errors import input_error_details
 from rpacore.doctor import collect_doctor_result
@@ -810,15 +811,15 @@ class TestCliTransaction:
         assert result.returncode == 0
         assert result.stderr == ""
         payload = json.loads(result.stdout)
-        assert payload["schema_version"] == 2
+        assert payload["schema_version"] == 3
         assert payload["command"] == "transaction:list"
         assert payload["limit"] == 100
-        assert payload["transactions"][0]["id"] == tx.id
-        assert payload["transactions"][0]["transaction_format_version"] == 3
-        assert payload["transactions"][0]["definition_identity"] == ""
-        assert payload["transactions"][0]["status"] == "successful"
-        assert payload["transactions"][0]["state"] == {"invoice": "001"}
-        assert payload["transactions"][0]["metadata"] == {"customer": "acme"}
+        assert payload["transactions"][0]["transaction"]["id"] == tx.id
+        assert payload["transactions"][0]["transaction"]["transaction_format_version"] == 3
+        assert payload["transactions"][0]["transaction"]["definition_identity"] == ""
+        assert payload["transactions"][0]["transaction"]["status"] == "successful"
+        assert payload["transactions"][0]["transaction"]["state"] == {"invoice": "001"}
+        assert payload["transactions"][0]["transaction"]["metadata"] == {"customer": "acme"}
 
     def test_transaction_list_limit_is_visible_and_applied(self, tmp_path: Path) -> None:
         db_path = tmp_path / "transactions.db"
@@ -923,7 +924,7 @@ class TestCliTransaction:
         assert result.returncode == 0
         assert result.stderr == ""
         payload = json.loads(result.stdout)
-        assert payload["schema_version"] == 2
+        assert payload["schema_version"] == 3
         assert payload["command"] == "transaction:show"
         detail = payload["transaction"]
         assert detail["transaction_format_version"] == 3
@@ -1071,7 +1072,7 @@ class TestCliTransaction:
             calls.append(kwargs)
             return query_page_for()
 
-        monkeypatch.setattr(cli_module, "query_transactions", query_page)
+        monkeypatch.setattr(transaction_cli, "query_transactions", query_page)
 
         result = cli_module.main(
             [
@@ -1088,7 +1089,7 @@ class TestCliTransaction:
         assert result == 0
         assert captured.err == ""
         assert json.loads(captured.out)["transactions"] == []
-        assert calls == [{"cursor": None, "limit": 1_000}]
+        assert calls == [{"cursor": None, "limit": 1_000, "statuses": None, "since": None, "until": None, "reference": None, "metadata_filter": None}]
 
     def test_transaction_export_follows_query_page_cursors(
         self,
@@ -1109,9 +1110,9 @@ class TestCliTransaction:
             return pages[kwargs["cursor"]]
 
         transactions = {first.id: first, second.id: second}
-        monkeypatch.setattr(cli_module, "query_transactions", query_page)
+        monkeypatch.setattr(transaction_cli, "query_transactions", query_page)
         monkeypatch.setattr(
-            cli_module,
+            transaction_cli,
             "load_transaction",
             lambda transaction_id, *_args, **_kwargs: transactions[transaction_id],
         )
@@ -1134,8 +1135,8 @@ class TestCliTransaction:
             transaction["id"] for transaction in json.loads(captured.out)["transactions"]
         ] == [first.id, second.id]
         assert calls == [
-            {"cursor": None, "limit": 1_000},
-            {"cursor": "next-page", "limit": 1_000},
+            {"cursor": None, "limit": 1_000, "statuses": None, "since": None, "until": None, "reference": None, "metadata_filter": None},
+            {"cursor": "next-page", "limit": 1_000, "statuses": None, "since": None, "until": None, "reference": None, "metadata_filter": None},
         ]
 
     def test_transaction_export_does_not_block_concurrent_checkpoint(
@@ -1159,7 +1160,7 @@ class TestCliTransaction:
             reference="checkpoint-during-export",
             created_at=datetime(2026, 7, 14, 12, 0, tzinfo=timezone.utc),
         )
-        serialize_transaction = cli_module.serialize_transaction
+        serialize_transaction = transaction_cli.serialize_transaction
         checkpoint_saved = False
 
         def serialize_with_checkpoint(transaction: Transaction) -> dict[str, object]:
@@ -1170,7 +1171,7 @@ class TestCliTransaction:
             return serialize_transaction(transaction)
 
         monkeypatch.setattr(
-            cli_module,
+            transaction_cli,
             "serialize_transaction",
             serialize_with_checkpoint,
         )
@@ -1219,7 +1220,7 @@ class TestCliTransaction:
         )
         save_transaction(deleted_during_export, str(db_path))
         save_transaction(first, str(db_path))
-        serialize_transaction = cli_module.serialize_transaction
+        serialize_transaction = transaction_cli.serialize_transaction
         cleanup_complete = False
 
         def serialize_after_cleanup(transaction: Transaction) -> dict[str, object]:
@@ -1233,7 +1234,7 @@ class TestCliTransaction:
             return serialize_transaction(transaction)
 
         monkeypatch.setattr(
-            cli_module,
+            transaction_cli,
             "serialize_transaction",
             serialize_after_cleanup,
         )
@@ -1265,12 +1266,12 @@ class TestCliTransaction:
         bad = Transaction(reference="bad", state={"runtime": object()})
         transactions = {good.id: good, bad.id: bad}
         monkeypatch.setattr(
-            cli_module,
+            transaction_cli,
             "query_transactions",
             lambda *_args, **_kwargs: query_page_for(good, bad),
         )
         monkeypatch.setattr(
-            cli_module,
+            transaction_cli,
             "load_transaction",
             lambda transaction_id, *_args, **_kwargs: transactions[transaction_id],
         )
@@ -1299,17 +1300,17 @@ class TestCliTransaction:
     ) -> None:
         transaction = Transaction(reference="collision")
         monkeypatch.setattr(
-            cli_module,
+            transaction_cli,
             "query_transactions",
             lambda *_args, **_kwargs: query_page_for(transaction),
         )
         monkeypatch.setattr(
-            cli_module,
+            transaction_cli,
             "load_transaction",
             lambda *_args, **_kwargs: transaction,
         )
         monkeypatch.setattr(
-            cli_module,
+            transaction_cli,
             "serialize_transaction",
             lambda _transaction: {"export_format_version": 999},
         )
@@ -1338,11 +1339,11 @@ class TestCliTransaction:
     ) -> None:
         tx = Transaction(reference="invoice", state={"runtime": object()})
         monkeypatch.setattr(
-            cli_module,
+            transaction_cli,
             "query_transactions",
             lambda *_args, **_kwargs: query_page_for(tx),
         )
-        monkeypatch.setattr(cli_module, "load_transaction", lambda *_args, **_kwargs: tx)
+        monkeypatch.setattr(transaction_cli, "load_transaction", lambda *_args, **_kwargs: tx)
 
         result = cli_module.main(
             ["transaction", "list", "--db", str(tmp_path / "transactions.db"), "--json"]
@@ -1370,7 +1371,7 @@ class TestCliTransaction:
 
         assert result.returncode == 0
         assert result.stderr == ""
-        assert json.loads(result.stdout)["transactions"][0]["id"] == tx.id
+        assert json.loads(result.stdout)["transactions"][0]["transaction"]["id"] == tx.id
 
     def test_transaction_show_json_uses_manifest_storage_path_by_default(self, tmp_path: Path) -> None:
         project = tmp_path / "project"

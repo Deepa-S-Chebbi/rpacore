@@ -6,6 +6,14 @@ All notable user-facing changes are recorded here.
 
 ### Added
 
+- Transaction list filters for status, aware creation-time windows, reference,
+  typed metadata and application run IDs, with cursor continuation and stored
+  outcome fields in human list/show output. Single-record export is available
+  through `transaction export --transaction-id ID` in both existing formats.
+- A disposable scaffold tutorial demonstrates failure after file publication,
+  separate-process recovery of the same ID, completed-step preservation,
+  persisted arguments, reports and selected exports. Installed-wheel CI covers
+  Windows and Ubuntu on Python 3.11–3.14 using one shared wheel artifact.
 - Newly scaffolded projects enable configured framework logging on stderr,
   including verbatim step-failure exception messages under the existing
   security policy. Logging values retain existing load-time validation;
@@ -18,6 +26,13 @@ All notable user-facing changes are recorded here.
   and require no migration.
 
 ### Breaking
+
+- Transaction list/show JSON advance to CLI schema v3 for truthful captured
+  outcomes beside unchanged transaction-v3 records. List consumers must read
+  `entry.transaction` and `entry.outcome`; show retains `payload.transaction`
+  and adds `payload.outcome`. Gate interpretation on `schema_version`.
+  List adds `has_more` and `next_cursor`. SQLite, query/cursor, export and report
+  formats remain unchanged; no database migration is required.
 
 - `rpacore init` now rejects invalid package basenames with usage error `2`
   before creating directories or files. Use a valid basename such as

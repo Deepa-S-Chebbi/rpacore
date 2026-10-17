@@ -183,3 +183,10 @@ Use this checklist for changes that touch security-sensitive surfaces:
 - CLI: machine-readable stdout stays parseable and diagnostics go to stderr
 
 Report potential vulnerabilities through [Security Policy](../SECURITY.md).
+
+Transaction list metadata filters can expose values through shell history or
+process arguments. Continuation instructions omit those values, but a cursor
+is an opaque continuation token rather than a credential or encrypted support
+bundle; avoid sharing it unnecessarily. CLI list/show JSON and single-record
+exports still include sensitive canonical records. Selecting one ID reduces
+scope but does not redact its state, metadata, arguments, or exception messages.

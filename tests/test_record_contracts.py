@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 import rpacore.cli as cli_module
+import rpacore._transaction_cli as transaction_cli
 from rpacore import (
     ExecutionTransition,
     Status,
@@ -74,6 +75,7 @@ def test_checked_examples_are_json_and_have_the_frozen_framework_envelopes() -> 
     )
     assert transaction_v3["transaction_format_version"] == 3
 
+    # CLI-v2 fixtures remain historical contracts; live CLI assertions use v3 below.
     for name, version_key, version in (
         ("cli-transaction-list-v2.json", "schema_version", 2),
         ("cli-transaction-show-v2.json", "schema_version", 2),
@@ -114,25 +116,25 @@ def test_query_cursor_v1_fixture_remains_accepted_and_rejects_future_versions(tm
         query_transactions(str(db_path), cursor=future_cursor)
 
 
-def test_cli_list_and_show_v2_fixtures_match_live_output(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_cli_list_and_show_v3_fixtures_match_live_output(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     db_path = tmp_path / "transactions.db"
     transaction = _fixture_transaction()
     save_transaction(transaction, str(db_path))
 
     assert cli_module.main(["transaction", "list", "--db", str(db_path), "--json"]) == 0
-    assert json.loads(capsys.readouterr().out) == _json_fixture("cli-transaction-list-v2.json")
+    assert json.loads(capsys.readouterr().out) == _json_fixture("cli-transaction-list-v3.json")
 
     assert cli_module.main(["transaction", "show", transaction.id, "--db", str(db_path), "--json"]) == 0
-    assert json.loads(capsys.readouterr().out) == _json_fixture("cli-transaction-show-v2.json")
+    assert json.loads(capsys.readouterr().out) == _json_fixture("cli-transaction-show-v3.json")
 
 
 def test_export_v2_fixtures_match_live_output(capsys: pytest.CaptureFixture[str]) -> None:
     transaction = _fixture_transaction()
 
-    cli_module._write_transaction_export([transaction], export_format="json")
+    transaction_cli._write_transaction_export([transaction], export_format="json")
     assert _normalize_export(json.loads(capsys.readouterr().out)) == _json_fixture("export-json-v2.json")
 
-    cli_module._write_transaction_export([transaction], export_format="ndjson")
+    transaction_cli._write_transaction_export([transaction], export_format="ndjson")
     ndjson = json.loads(capsys.readouterr().out)
     assert _normalize_export(ndjson) == json.loads(
         (_FIXTURES / "export-ndjson-v2.ndjson").read_text(encoding="utf-8")

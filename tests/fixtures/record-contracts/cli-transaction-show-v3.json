@@ -1,0 +1,29 @@
+{
+  "schema_version": 3,
+  "command": "transaction:show",
+  "transaction": {
+    "transaction_format_version": 3,
+    "id": "transaction-v3",
+    "reference": "fixture",
+    "definition_identity": "fixture/v3",
+    "status": "successful",
+    "retry_count": 0,
+    "created_at": "2026-07-27T12:00:00+00:00",
+    "started_at": null,
+    "finished_at": null,
+    "state": {
+      "invoice": "001"
+    },
+    "metadata": {
+      "customer": "acme"
+    },
+    "steps": [],
+    "history": [],
+    "artifacts": []
+  },
+  "outcome": {
+    "category": "unknown",
+    "retry_disposition": "unknown",
+    "failure_code": ""
+  }
+}

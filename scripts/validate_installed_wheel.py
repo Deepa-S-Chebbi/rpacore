@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -306,6 +307,10 @@ assert transition_record["schema_version"] == 2
 
 
 def _scaffold_smoke_code() -> str:
+    tutorial = (Path(__file__).resolve().parents[1] / "docs" / "tutorial.md").read_text(encoding="utf-8")
+    recipe_files = dict(re.findall(r"<!-- recovery-file: ([\w.]+) -->\n```python\n(.*?)\n```", tutorial, re.DOTALL))
+    if set(recipe_files) != {"recovery.py", "inject_demo_failure.py", "restore_demo_step.py"}:
+        raise ValidationError("Tutorial recovery recipe files are missing")
     return r'''
 from pathlib import Path
 import json
@@ -364,9 +369,9 @@ for name in ("installed_project", "a", "1", "Demo.Project-1", "demo_project", "d
     run(cli + ["run"], project)
     assert (project / "greeting.txt").read_text(encoding="utf-8") == "Hello, Alice\n"
     transactions = json.loads(run(cli + ["transaction", "list", "--json"], project).stdout)["transactions"]
-    assert len(transactions) == 1 and transactions[0]["status"] == "successful", transactions
-    assert transactions[0]["definition_identity"] == "generated-greeting/v2"
-    assert transactions[0]["steps"][0]["status"] == "successful"
+    assert len(transactions) == 1 and transactions[0]["transaction"]["status"] == "successful", transactions
+    assert transactions[0]["transaction"]["definition_identity"] == "generated-greeting/v2"
+    assert transactions[0]["transaction"]["steps"][0]["status"] == "successful"
     print(f"Installed scaffold build/tests/run/persisted success passed: {name}")
 
 # Receipt publication under this exact installed Core wheel; source pytest owns
@@ -384,7 +389,7 @@ nested.mkdir()
 result = run(cli + ["run"], nested)
 assert result.stdout.strip() and ": successful" in result.stdout, result.stdout
 transactions = json.loads(run(cli + ["transaction", "list", "--json"], nested).stdout)["transactions"]
-saved = transactions[0]
+saved = transactions[0]["transaction"]
 destination = project / "greeting.txt"
 assert saved["steps"][0]["arguments"]["output_path"] == str(destination)
 assert saved["state"]["greeting_path"] == str(destination)
@@ -392,61 +397,97 @@ assert saved["artifacts"][0]["path"] == str(destination)
 assert Path(saved["artifacts"][0]["path"]).read_bytes() == b"Hello, Alice\n"
 assert not (nested / "greeting.txt").exists()
 
-# Ordinary system failure after the complete file is replaced, before metadata.
+# Execute the public tutorial's exact application and temporary injection scripts.
 replay_project = root / "parent with spaces" / "replay-journey"
 run(cli + ["init", str(replay_project)], root)
-step_path = replay_project / "steps" / "greeting.py"
-step_source = step_path.read_text(encoding="utf-8")
-step_path.write_text(step_source + (
-    "\nfrom contextlib import contextmanager\n"
-    "real_atomic_output_path = atomic_output_path\n"
-    "@contextmanager\n"
-    "def atomic_output_path(destination):\n"
-    "    with real_atomic_output_path(destination) as temporary:\n"
-    "        yield temporary\n"
-    "    raise RuntimeError('controlled-post-publication-failure')\n"
-), encoding="utf-8")
-failed = subprocess.run(cli + ["run"], cwd=replay_project, capture_output=True, text=True)
+recipe_files = __RECOVERY_RECIPE_FILES__
+for name, source in recipe_files.items():
+    (replay_project / name).write_text(source, encoding="utf-8")
+run([sys.executable, "-m", "build", "--no-isolation", "--wheel", "--outdir", str(root / "recovery-wheels")], replay_project)
+run([sys.executable, "-m", "pytest", "tests/test_greeting_step.py", "-q"], replay_project)
+replay_db = replay_project / "rpacore.db"
+doctor = json.loads(run(cli + ["doctor", "--json"], replay_project).stdout)
+assert not replay_db.exists()
+assert next(c for c in doctor["checks"] if c["id"] == "transactions.schema")["status"] == "not_applicable"
+application = [sys.executable, str(replay_project / "recovery.py"), str(replay_project), str(replay_db)]
+run(application, root)  # Unrelated success in the same database.
+original_step = (replay_project / "steps" / "greeting.py").read_bytes()
+run([sys.executable, str(replay_project / "inject_demo_failure.py")], root)
+failed = subprocess.run(application, cwd=root, capture_output=True, text=True)
 assert failed.returncode == 1 and ": failed" in failed.stdout, failed
-records = json.loads(run(cli + ["transaction", "list", "--json"], replay_project).stdout)["transactions"]
-assert len(records) == 1
-saved = records[0]
-assert saved["status"] == "failed" and saved["steps"][0]["status"] == "failed"
-assert saved["steps"][0]["exceptions"][-1]["type"] == "system"
-assert saved["steps"][0]["exceptions"][-1]["message"] == "controlled-post-publication-failure"
-assert saved["state"] == {} and saved["artifacts"] == []
+selection = cli + ["transaction", "list", "--db", str(replay_db), "--run-id", "tutorial-run", "--status", "failed", "--json"]
+payload = json.loads(run(selection, root).stdout)
+assert payload["schema_version"] == 3 and not payload["has_more"]
+assert len(payload["transactions"]) == 1
+entry = payload["transactions"][0]
+saved = entry["transaction"]
+assert entry["outcome"]["category"] == "system_failed"
+assert saved["definition_identity"] == "tutorial-greeting/v1"
+assert [step["status"] for step in saved["steps"]] == ["successful", "failed"]
+assert saved["state"] == {"preparation_count": 1} and saved["artifacts"] == []
+assert saved["steps"][1]["exceptions"][-1]["message"] == "controlled-post-publication-failure"
 replay_destination = replay_project / "greeting.txt"
 published = replay_destination.read_bytes()
 assert published == b"Hello, Alice\n"
-step_path.write_text(step_source, encoding="utf-8")
-replay_code = """
+run([sys.executable, str(replay_project / "restore_demo_step.py")], root)
+assert (replay_project / "steps" / "greeting.py").read_bytes() == original_step
+assert not (replay_project / "steps" / "greeting.py.backup").exists()
+# A wrong identity cannot mutate a closed current database.
+before_mismatch = replay_db.read_bytes()
+mismatch = """
 import sys
 from pathlib import Path
-from rpacore import Engine, Status, execute_transaction, resume_transaction
+from rpacore import DefinitionIdentityError, resume_transaction
 project = Path(sys.argv[1])
 sys.path.insert(0, str(project))
-from steps.greeting import WriteGreeting
-tx = resume_transaction(sys.argv[2], [WriteGreeting(
-    name="write_greeting", execution_order=1,
-    arguments={"name": "different", "output_path": str(Path.cwd() / "wrong.txt")},
-)], db_path=str(project / "rpacore.db"), definition_identity="generated-greeting/v2")
-assert tx.id == sys.argv[2]
-assert tx.steps[0].arguments == {"name": "Alice", "output_path": str(project / "greeting.txt")}
-execute_transaction(tx, engine=Engine(), transaction_db_path=str(project / "rpacore.db"))
-assert tx.status is Status.SUCCESSFUL
-assert not Path("wrong.txt").exists()
+from recovery import steps
+try:
+    resume_transaction(sys.argv[2], steps(project, resuming=True), db_path=str(project / "rpacore.db"), definition_identity="incompatible/v1")
+except DefinitionIdentityError:
+    pass
+else:
+    raise AssertionError("identity mismatch accepted")
 """
-run([sys.executable, "-c", replay_code, str(replay_project), saved["id"]], root)
-final = json.loads(run(cli + ["transaction", "show", saved["id"], "--db", str(replay_project / "rpacore.db"), "--json"], root).stdout)["transaction"]
+run([sys.executable, "-c", mismatch, str(replay_project), saved["id"]], root)
+assert replay_db.read_bytes() == before_mismatch
+run(application + ["--resume", saved["id"]], root)
+final_payload = json.loads(run(cli + ["transaction", "show", saved["id"], "--db", str(replay_db), "--json"], root).stdout)
+final = final_payload["transaction"]
 assert final["id"] == saved["id"] and final["status"] == "successful"
-assert final["steps"][0]["status"] == "successful"
+assert final_payload["outcome"]["category"] == "successful"
+assert [step["status"] for step in final["steps"]] == ["successful", "successful"]
+assert final["state"]["preparation_count"] == 1
+assert final["steps"][1]["arguments"] == {"name": "Alice", "output_path": str(replay_destination)}
+started = [event["step_name"] for event in final["history"] if event["event"] == "step_started"]
+assert started.count("prepare_greeting") == 1 and started.count("write_greeting") == 2, started
+assert any(event["event"] == "transaction_resumed" for event in final["history"])
 assert final["state"]["greeting_path"] == str(replay_destination)
 assert final["artifacts"][0]["path"] == str(replay_destination)
 assert replay_destination.read_bytes() == published
-assert list(replay_project.rglob("greeting.txt")) == [replay_destination]
+assert not (replay_project / "wrong.txt").exists()
 assert not list(replay_project.glob(".greeting.txt.*.tmp"))
-assert len(json.loads(run(cli + ["transaction", "list", "--json"], replay_project).stdout)["transactions"]) == 1
-print("Installed pre-run doctor, nested output, and same-ID post-publication replay passed")
+report_path = replay_project / f"report-{saved['id']}.json"
+report = json.loads(report_path.read_text(encoding="utf-8"))
+assert report["report_format_version"] == 2 and report["transaction"]["id"] == saved["id"]
+assert report["transaction"]["outcome"]["category"] == "successful"
+for format in ("json", "ndjson"):
+    result = run(cli + ["transaction", "export", "--db", str(replay_db), "--transaction-id", saved["id"], "--format", format], root)
+    exported = json.loads(result.stdout)
+    records = exported["transactions"] if format == "json" else [exported]
+    assert len(records) == 1 and records[0]["id"] == saved["id"]
+    assert exported["export_format_version"] == 2
+    assert records[0]["transaction_format_version"] == 3
+    if format == "json":
+        assert records[0] == final
+    else:
+        assert {k: v for k, v in records[0].items() if k not in {"export_format_version", "framework_version", "exported_at"}} == final
+all_records = json.loads(run(cli + ["transaction", "list", "--db", str(replay_db), "--run-id", "tutorial-run", "--json"], root).stdout)
+assert len(all_records["transactions"]) == 2
+before_noop = replay_db.read_bytes()
+run(application + ["--resume", saved["id"]], root)
+assert replay_db.read_bytes() == before_noop
+assert replay_destination.read_bytes() == published
+print(f"Installed tutorial journey passed; recovered ID: {saved['id']}; database: {replay_db}; output: {replay_destination}; report: {report_path}")
 
 # Fail the final checkpoint after real SQLite writes and successful step work.
 # This custom callback bypasses Core's transient-lock retry wrapper.
@@ -473,7 +514,7 @@ assert "durable outcome is unconfirmed" in result.stderr, result.stderr
 assert "Project execution failed: controlled-final-checkpoint-failure" in result.stderr
 print("Installed receipt smoke passed: successful run and final-checkpoint abort")
 print("Limitation: custom checkpoint injection bypasses transient SQLite retries")
-'''
+'''.replace("__RECOVERY_RECIPE_FILES__", repr(recipe_files))
 
 
 def validate_installed_wheel(
