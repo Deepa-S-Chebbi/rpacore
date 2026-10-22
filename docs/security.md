@@ -74,6 +74,13 @@ captured logs.
 Generated projects default to the environment credential provider. Environment
 variables and OS keyrings are read at runtime; their resolved secret values
 should not be copied into transaction state, metadata, logs, reports, or exports.
+New entrypoints explicitly build and inject the selected config provider;
+construction reads no secret and the greeting never requests one. Existing
+projects require an explicit [injection edit](config.md#credential-selection-in-existing-projects).
+Doctor reads no credentials and does not import user code. Its config advisories
+expose only known setting names, aggregate counts and fixed path-mismatch facts,
+never unknown names, values or paths. Similarity warnings can match intentional
+application keys; they do not establish runtime wiring or actual credential use.
 
 Generated `.gitignore` files exclude the default virtual environment, Python
 caches, pytest cache, sample SQLite database, and sample output file. Extend the

@@ -28,6 +28,10 @@ with the project manifest's storage path, so execution and default inspection
 refer to the same durable transaction history. It also supplies a stable
 application-owned `definition_identity` so an interrupted run can be resumed
 only by a compatible automation definition.
+It constructs `credential_provider` from config with `build_credential_provider`
+and passes it explicitly to execution. Construction reads no secret; the greeting
+does not request credentials. Existing projects can adopt the
+[provider-injection edit](config.md#credential-selection-in-existing-projects).
 
 New scaffolds use `generated-greeting/v2`. Their default `greeting.txt` is
 anchored to the project root, including runs from nested directories. The step
@@ -165,6 +169,26 @@ contain scalar `pending_items`, `in_progress_items`, `successful_items`,
 `oldest_age_seconds`. When a SQLite header reports WAL, Doctor does not open the
 database at all: it reports a journal warning and marks deeper checks
 `not_applicable` to preserve WAL sidecars.
+
+A valid `project.config` can report `warning` with optional
+`details.advisories`. A typo entry has exactly
+`code="possible_framework_key_typo"`, a known dotted `suggested_key`, and
+positive integer `count` (the number of unrecognized names suggesting that
+setting). Entries are sorted by suggested key. A final
+`{"code": "transaction_path_mismatch"}` entry warns that explicit config and
+manifest transaction paths differ; it contains no paths. Human summaries show
+every suggestion/count and explain manifest storage authority for generated or
+CLI-managed projects versus explicit library storage choice. Clean config
+checks retain their existing empty details.
+
+These are [nonfatal heuristics](config.md#static-guidance-before-execution),
+not evidence that an application's config is unused. Unknown keys remain valid;
+doctor emits no unknown names, values or raw paths. It cannot validate callable
+availability, definition identity or step wiring without running user code.
+An internal diagnostic failure instead returns exit `1`, leaves stdout empty
+even with `--json`, and reports `Could not complete doctor diagnostics` on
+stderr. It does not label that framework failure as an invalid config file or
+emit exception details.
 
 Exit codes:
 

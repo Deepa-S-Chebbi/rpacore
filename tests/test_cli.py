@@ -15,6 +15,7 @@ import pytest
 import rpacore.cli as cli_module
 import rpacore._transaction_cli as transaction_cli
 import rpacore.doctor as doctor_module
+import rpacore._doctor_config as doctor_config_module
 from rpacore._doctor_errors import input_error_details
 from rpacore.doctor import collect_doctor_result
 from rpacore import (
@@ -279,7 +280,7 @@ class TestCliDoctor:
         if target == "manifest":
             monkeypatch.setattr(doctor_module, "load_project_manifest", denied)
         elif target == "config":
-            monkeypatch.setattr(doctor_module, "load_config", denied)
+            monkeypatch.setattr(doctor_config_module, "_load_config", denied)
         else:
             monkeypatch.setattr(Path, "open", denied)
         result = collect_doctor_result()
@@ -382,7 +383,7 @@ class TestCliDoctor:
     def test_invalid_discovered_database_paths_are_not_absence(self, tmp_path, monkeypatch, path):
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr(doctor_module, "_discover_manifest", lambda: (None, []))
-        monkeypatch.setattr(doctor_module, "_discover_config", lambda **kwargs: ({"queue": {"db_path": path}}, []))
+        monkeypatch.setattr(doctor_module, "discover_config", lambda **kwargs: ({"queue": {"db_path": path}}, []))
         result = collect_doctor_result()
         schema = next(c for c in result.checks if c.id == "queue.schema")
         assert schema.status == "fail" and schema.details == {}
@@ -411,7 +412,7 @@ class TestCliDoctor:
                 raise exception
             return real_stat(candidate, **kwargs)
         monkeypatch.setattr(Path, "stat", fail_stat)
-        config, checks = doctor_module._discover_config(config_path=None, manifest_dir=tmp_path)
+        config, checks = doctor_config_module.discover_config(config_path=str(path), manifest=None)
         assert config is None and checks[0].status == "fail"
         assert checks[0].details == {"cause": "unreadable" if isinstance(exception, OSError) else "unexpected"}
         assert "private-marker" not in json.dumps(checks[0].to_dict())
@@ -423,7 +424,8 @@ class TestCliDoctor:
         monkeypatch.chdir(project)
         def disappeared(*args, **kwargs):
             raise FileNotFoundError("private-marker")
-        monkeypatch.setattr(doctor_module, "load_project_manifest" if target == "manifest" else "load_config", disappeared)
+        monkeypatch.setattr(doctor_module if target == "manifest" else doctor_config_module,
+                            "load_project_manifest" if target == "manifest" else "_load_config", disappeared)
         result = collect_doctor_result()
         check = next(c for c in result.checks if c.id == f"project.{target}")
         assert check.status == "fail" and check.details == {"cause": "unreadable"}

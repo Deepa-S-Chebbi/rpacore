@@ -374,6 +374,61 @@ for name in ("installed_project", "a", "1", "Demo.Project-1", "demo_project", "d
     assert transactions[0]["transaction"]["steps"][0]["status"] == "successful"
     print(f"Installed scaffold build/tests/run/persisted success passed: {name}")
 
+# Static guidance and real configured-provider injection under the installed wheel.
+config_project = root / "configuration-journey"
+run(cli + ["init", str(config_project)], root)
+config_nested = config_project / "nested"
+config_nested.mkdir()
+(config_project / "config.toml").write_text(
+    'max_retry=7\ntransaction_db_path="private-storage.db"\n'
+    '[queue]\nlease_timout=300\n', encoding="utf-8",
+)
+before = {p: p.read_bytes() for p in config_project.rglob("*") if p.is_file()}
+for cwd in (config_project, config_nested):
+    payload = json.loads(run(cli + ["doctor", "--json"], cwd).stdout)
+    assert payload["doctor_format_version"] == 1
+    check = next(c for c in payload["checks"] if c["id"] == "project.config")
+    assert check["status"] == "warning"
+    assert check["details"] == {"advisories": [
+        {"code": "possible_framework_key_typo", "suggested_key": "max_retries", "count": 1},
+        {"code": "possible_framework_key_typo", "suggested_key": "queue.lease_timeout", "count": 1},
+        {"code": "transaction_path_mismatch"},
+    ]}
+    human = run(cli + ["doctor"], cwd).stdout
+    assert check["summary"] in human and "manifest" in human
+    assert "max_retry" not in human and "private-storage" not in human
+    assert {p: p.read_bytes() for p in config_project.rglob("*") if p.is_file()} == before
+provider_probe = """
+import runpy, sys
+from pathlib import Path
+import rpacore
+project = Path(sys.argv[1])
+expected = getattr(rpacore, sys.argv[2])
+def forbidden(*args, **kwargs):
+    raise AssertionError("Credentials must not be read")
+rpacore.EnvCredentialProvider.get = forbidden
+rpacore.KeyringCredentialProvider.get = forbidden
+sys.modules["keyring"] = None
+sys.path.insert(0, str(project))
+from steps.greeting import WriteGreeting
+original = WriteGreeting.execute
+seen = []
+def inspect(self, ctx):
+    assert isinstance(ctx.credentials, expected)
+    seen.append(type(ctx.credentials))
+    original(self, ctx)
+WriteGreeting.execute = inspect
+application = runpy.run_path(str(project / "main.py"))
+assert application["main"]() == 0
+assert seen == [expected]
+assert sys.modules["keyring"] is None
+"""
+for setting, class_name in (("env", "EnvCredentialProvider"), ("keyring", "KeyringCredentialProvider")):
+    (config_project / "config.toml").write_text(f'credential_provider="{setting}"\n', encoding="utf-8")
+    run([sys.executable, "-c", provider_probe, str(config_project), class_name], config_nested)
+assert (config_project / "greeting.txt").read_bytes() == b"Hello, Alice\n"
+print("Installed configuration advisories and env/keyring context injection passed without credential reads")
+
 # Receipt publication under this exact installed Core wheel; source pytest owns
 # the logging, failure-category, and initial/final checkpoint scenario matrix.
 project = root / "parent with spaces" / "receipt-journey"

@@ -6,6 +6,11 @@ All notable user-facing changes are recorded here.
 
 ### Added
 
+- `doctor` offers nonfatal, privacy-bounded guidance for likely root, queue and
+  notification setting typos and divergent explicit config/manifest transaction
+  paths. Doctor-v1 config details optionally include ordered advisory codes,
+  known suggested keys and counts; human summaries explain the same findings.
+  Custom keys remain valid and database selection is unchanged.
 - Transaction list filters for status, aware creation-time windows, reference,
   typed metadata and application run IDs, with cursor continuation and stored
   outcome fields in human list/show output. Single-record export is available
@@ -41,6 +46,10 @@ All notable user-facing changes are recorded here.
 
 ### Fixed
 
+- New generated entrypoints explicitly build and inject the configured credential
+  provider before durable work. The default remains env; construction and the
+  greeting read no secrets. Existing projects can add explicit provider injection
+  as described in the configuration reference; no data migration is required.
 - `doctor` treats only absent discovered transaction/queue storage as unchecked
   `not_applicable`, including queue paths from explicit `--config`. Direct DB
   flags still fail on absence; an absent/invalid explicit config also fails.

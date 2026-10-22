@@ -145,6 +145,12 @@ environment variables, or enforce cross-field rules.
 
 ## Credentials, Logging, Reports, and Notifications
 
+`execute_transaction(config=...)` exposes config to steps without automatically
+applying Engine, storage or provider settings. Inject `credentials=` explicitly
+to select a provider; omission preserves the env default. Provider construction
+does not read secrets. See [configuration consumers](config.md#which-code-consumes-a-setting)
+and the [existing-project edit](config.md#credential-selection-in-existing-projects).
+
 | Symbol | Purpose | Side effects |
 | --- | --- | --- |
 | `CredentialProvider`, `EnvCredentialProvider`, `KeyringCredentialProvider`, `CredentialNotFoundError`, `build_credential_provider` | Resolve credentials from documented providers. | Environment/keyring reads depending on provider. Credentials are not persisted by RPA Core. |
@@ -215,15 +221,18 @@ retyping, or changing the meaning of one requires a new version. Existing
 conditional fields retain their documented conditions; they do not create a
 general extension point.
 
-Doctor format v1 check details include the optional `reason`, `cause`, and
-`location` diagnostics documented in the [CLI reference](cli.md#rpacore-doctor).
-These scalar details do not change the envelope, check IDs, or status vocabulary.
+Doctor format v1 check details include the optional `reason`, `cause`,
+`location` and config `advisories` diagnostics documented in the
+[CLI reference](cli.md#rpacore-doctor). These documented additions preserve the
+envelope, check IDs and status vocabulary. Config advisories contain fixed
+codes, known suggested setting names and counts; they contain no config values
+or unknown application key names.
 
 Query cursors are opaque. Pass a cursor only back to the matching
 `query_transactions()` call; the framework accepts its supported cursor version
 and rejects unsupported versions. JSON log v3 keeps a protected envelope and
 confines event attributes to `attributes`. Doctor
-consumers should use check `id`, `status`, and documented scalar detail fields;
+consumers should use check `id`, `status`, and documented detail fields;
 summary prose is for people rather than semantic parsing.
 
 ## Queue Processing

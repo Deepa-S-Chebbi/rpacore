@@ -64,6 +64,14 @@ Earlier v1 projects remain unchanged and require no migration. The remaining
 steps below describe a separate hand-written application with its own definition
 and path choices.
 
+Doctor also offers nonfatal guidance for likely framework setting typos and
+explicit config/manifest transaction path differences. It never imports your
+entrypoint and cannot prove application wiring. New generated projects inject
+their configured credential provider; the greeting needs no secret. Existing
+projects can use the [provider-injection edit](config.md#credential-selection-in-existing-projects).
+See [configuration consumers](config.md#which-code-consumes-a-setting) for
+Engine retries, queue redelivery and storage ownership.
+
 ## Step 3: Create A Virtual Environment
 
 ```powershell

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import math
 import tomllib
+from copy import deepcopy
 from pathlib import Path
+from typing import NamedTuple
 
 from rpacore._validation import type_error, value_error
 from rpacore._sqlite import validate_durable_sqlite_path
@@ -22,6 +24,11 @@ _DEFAULTS: dict[str, object] = {
 }
 _LOG_LEVELS = frozenset({"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG", "NOTSET"})
 _LOG_FORMATS = frozenset({"text", "json"})
+
+
+class _LoadedConfig(NamedTuple):
+    config: dict[str, object]
+    source: dict[str, object]
 
 
 def _validate(config: dict[str, object]) -> None:
@@ -139,14 +146,22 @@ def load_config(path: str | Path = "config.toml", *, require_file: bool = False)
     transaction_db_path, queue.db_path, and non-empty screenshot_dir are
     resolved relative to the config file's directory.
     """
+    return _load_config(path, require_file=require_file).config
+
+
+def _load_config(
+    path: str | Path, *, require_file: bool = False,
+) -> _LoadedConfig:
+    """Share one parse and normalization path with static config inspection."""
     config = dict(_DEFAULTS)
     resolved = Path(path)
     base_dir: Path | None = None
+    source: dict[str, object] = {}
 
     if resolved.exists():
         with open(resolved, "rb") as f:
-            overrides = tomllib.load(f)
-        config.update(overrides)
+            source = tomllib.load(f)
+        config.update(deepcopy(source))
         base_dir = resolved.resolve().parent
     elif require_file:
         raise FileNotFoundError(f"Config file not found: {resolved}")
@@ -154,4 +169,4 @@ def load_config(path: str | Path = "config.toml", *, require_file: bool = False)
     _validate(config)
     if base_dir is not None:
         _resolve_config_paths(config, base_dir=base_dir)
-    return config
+    return _LoadedConfig(config=config, source=source)

@@ -10,6 +10,40 @@ from rpacore.config import load_config
 
 
 class TestLoadConfig:
+    def test_source_document_stays_as_parsed_and_independent_of_normalized_config(self, tmp_path):
+        from rpacore.config import _load_config
+
+        path = tmp_path / "config.toml"
+        path.write_text('[queue]\ndb_path="relative/queue.db"\n[application]\nvalues=[1, 2]\n', encoding="utf-8")
+        loaded = _load_config(path)
+        assert loaded.source == {"queue": {"db_path": "relative/queue.db"}, "application": {"values": [1, 2]}}
+        assert loaded.config["queue"] == {"db_path": str(tmp_path / "relative/queue.db")}
+        loaded.config["queue"]["db_path"] = "changed"
+        loaded.config["application"]["values"].append(3)
+        assert loaded.source["queue"]["db_path"] == "relative/queue.db"
+        assert loaded.source["application"]["values"] == [1, 2]
+
+    def test_doctor_and_public_loader_share_one_parse_each(self, tmp_path, monkeypatch):
+        import rpacore.config as config_module
+        from rpacore.doctor import collect_doctor_result
+
+        source = tmp_path / "config.toml"
+        source.write_text('max_retry=3\n[application]\nprivate_key="kept"\n', encoding="utf-8")
+        original = config_module.tomllib.load
+        reads = []
+        def counted(file):
+            reads.append(file.name)
+            return original(file)
+        monkeypatch.setattr(config_module.tomllib, "load", counted)
+        monkeypatch.chdir(tmp_path)
+        result = collect_doctor_result(config_path=str(source))
+        assert next(c for c in result.checks if c.id == "project.config").status == "warning"
+        assert reads == [str(source)]
+        config = load_config(source)
+        assert reads == [str(source), str(source)]
+        assert type(config) is dict and config["max_retries"] == 0 and config["max_retry"] == 3
+        assert config["application"] == {"private_key": "kept"}
+
     def test_repository_sample_config_uses_lease_timeout(self) -> None:
         sample = Path(__file__).resolve().parents[1] / "config.toml"
         text = sample.read_text(encoding="utf-8")

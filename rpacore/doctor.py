@@ -5,12 +5,15 @@ from __future__ import annotations
 import platform
 import sqlite3
 import stat
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 from rpacore import __version__
-from rpacore._doctor_errors import input_error_details
+from rpacore._doctor_check import (
+    FAIL, NOT_APPLICABLE, PASS, WARNING, DoctorCheck, input_failure,
+)
+from rpacore._doctor_config import discover_config
 from rpacore._sqlite import (
     QUEUE_SCHEMA_VERSION,
     TRANSACTION_SCHEMA_VERSION,
@@ -19,33 +22,10 @@ from rpacore._sqlite import (
     require_current_schema,
     validate_durable_sqlite_path,
 )
-from rpacore.config import load_config
 from rpacore.manifest import ProjectManifest, find_project_manifest, load_project_manifest
 
 
 DOCTOR_FORMAT_VERSION = 1
-PASS = "pass"
-WARNING = "warning"
-FAIL = "fail"
-NOT_APPLICABLE = "not_applicable"
-
-
-@dataclass(frozen=True)
-class DoctorCheck:
-    """One privacy-bounded, JSON-safe diagnostic result."""
-
-    id: str
-    status: str
-    summary: str
-    details: dict[str, object] = field(default_factory=dict)
-
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "id": self.id,
-            "status": self.status,
-            "summary": self.summary,
-            "details": self.details,
-        }
 
 
 @dataclass(frozen=True)
@@ -90,9 +70,9 @@ def collect_doctor_result(
     manifest, manifest_checks = _discover_manifest()
     checks.extend(manifest_checks)
 
-    config, config_checks = _discover_config(
+    config, config_checks = discover_config(
         config_path=config_path,
-        manifest_dir=None if manifest is None else manifest.project_dir,
+        manifest=manifest,
     )
     checks.extend(config_checks)
 
@@ -140,53 +120,12 @@ def _discover_manifest() -> tuple[ProjectManifest | None, list[DoctorCheck]]:
     except FileNotFoundError:
         return None, [DoctorCheck("project.manifest", NOT_APPLICABLE, "No project manifest found")]
     except Exception as exc:
-        return None, [_input_failure("project.manifest", "Project manifest", exc)]
+        return None, [input_failure("project.manifest", "Project manifest", exc)]
     try:
         manifest = load_project_manifest(candidate)
     except Exception as exc:
-        return None, [_input_failure("project.manifest", "Project manifest", exc)]
+        return None, [input_failure("project.manifest", "Project manifest", exc)]
     return manifest, [DoctorCheck("project.manifest", PASS, "Project manifest is valid")]
-
-
-def _input_failure(check_id: str, label: str, exc: Exception) -> DoctorCheck:
-    details = input_error_details(exc)
-    location = f" ({details['location']})" if "location" in details else ""
-    return DoctorCheck(
-        check_id, FAIL,
-        f"{label}: {details['cause']}{location}; check the file's syntax, fields, and readability",
-        details,
-    )
-
-
-def _discover_config(
-    *,
-    config_path: str | None,
-    manifest_dir: Path | None,
-) -> tuple[dict[str, object] | None, list[DoctorCheck]]:
-    explicit = config_path is not None
-    candidate: Path | None = None
-    if config_path is not None:
-        candidate = Path(config_path)
-    elif manifest_dir is not None:
-        candidate = manifest_dir / "config.toml"
-    if candidate is None:
-        return None, [DoctorCheck("project.config", NOT_APPLICABLE, "No configuration file selected")]
-    try:
-        candidate.stat()
-    except FileNotFoundError as exc:
-        if explicit:
-            return None, [_input_failure("project.config", "Configuration file", exc)]
-        return None, [DoctorCheck("project.config", NOT_APPLICABLE, "No configuration file selected")]
-    except Exception as exc:
-        return None, [_input_failure("project.config", "Configuration file", exc)]
-    try:
-        config = load_config(candidate, require_file=True)
-    except Exception as exc:
-        return None, [_input_failure("project.config", "Configuration file", exc)]
-    queue = config.get("queue")
-    if queue is not None and not isinstance(queue, dict):
-        return None, [_input_failure("project.config", "Configuration file", TypeError())]
-    return config, [DoctorCheck("project.config", PASS, "Configuration file is valid")]
 
 
 def _database_checks(

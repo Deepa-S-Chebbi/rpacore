@@ -32,6 +32,54 @@ def parse_generated_receipt(output: str, project: Path, label: str) -> str:
 
 
 class TestGeneratedProject:
+    @pytest.mark.parametrize("setting,provider_class", [("env", "EnvCredentialProvider"), ("keyring", "KeyringCredentialProvider")])
+    def test_selected_provider_reaches_step_context_without_secret_access(self, tmp_path, setting, provider_class):
+        project = tmp_path / "demo"
+        assert run_cli("init", str(project), cwd=tmp_path).returncode == 0
+        (project / "config.toml").write_text(f'credential_provider="{setting}"\n', encoding="utf-8")
+        probe = textwrap.dedent('''
+            import runpy, sys
+            from pathlib import Path
+            import rpacore
+            project = Path(sys.argv[1])
+            expected = getattr(rpacore, sys.argv[2])
+            def forbidden(*args, **kwargs):
+                raise AssertionError("Credentials must not be read")
+            rpacore.EnvCredentialProvider.get = forbidden
+            rpacore.KeyringCredentialProvider.get = forbidden
+            class NoKeyring:
+                def find_spec(self, fullname, *args):
+                    if fullname == "keyring":
+                        forbidden()
+            sys.meta_path.insert(0, NoKeyring())
+            sentinel = expected()
+            factory = rpacore.build_credential_provider
+            def build(name):
+                assert isinstance(factory(name), expected)
+                assert not (project / "rpacore.db").exists()
+                return sentinel
+            rpacore.build_credential_provider = build
+            sys.path.insert(0, str(project))
+            from steps.greeting import WriteGreeting
+            original = WriteGreeting.execute
+            seen = []
+            def inspect(self, ctx):
+                assert ctx.credentials is sentinel
+                seen.append(ctx.credentials)
+                original(self, ctx)
+            WriteGreeting.execute = inspect
+            application = runpy.run_path(str(project / "main.py"))
+            assert application["main"]() == 0
+            assert seen == [sentinel]
+            assert "keyring" not in sys.modules
+        ''')
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(REPO_ROOT)
+        result = subprocess.run([sys.executable, "-c", probe, str(project), provider_class],
+                                cwd=tmp_path, env=env, capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        assert (project / "greeting.txt").read_bytes() == b"Hello, Alice\n"
+
     @pytest.mark.parametrize("name", [
         "my project", ".demo", "demo.", "_demo", "demo_", "-demo", "demo-",
         'my"project', "my'project", "démø", "Kelvin", "demo\n", "demo\t", "demo\x01",

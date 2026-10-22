@@ -68,6 +68,7 @@ def _main_py() -> str:
             Engine,
             Status,
             Transaction,
+            build_credential_provider,
             configure_logger,
             execute_transaction,
             load_config,
@@ -84,6 +85,7 @@ def _main_py() -> str:
                 level="DEBUG" if log_level == "NOTSET" else log_level,
                 fmt=str(config["log_format"]),
             )
+            credentials = build_credential_provider(str(config["credential_provider"]))
             manifest = load_project_manifest(project_dir)
             transaction = Transaction(
                 reference="generated-greeting",
@@ -111,6 +113,7 @@ def _main_py() -> str:
                 execute_transaction(
                     transaction,
                     config=config,
+                    credentials=credentials,
                     engine=engine,
                     transaction_db_path=manifest.transaction_db_path,
                 )
