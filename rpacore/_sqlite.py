@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import stat
 from pathlib import Path
 
 from rpacore._validation import type_error, value_error
@@ -143,3 +144,16 @@ def configure_rollback_journal(connection: sqlite3.Connection) -> str:
             f"Could not configure safe SQLite rollback journal; got {journal_mode!r}"
         )
     return journal_mode
+
+
+def database_header_journal_mode(db_path: str, *, field: str) -> str:
+    """Read the SQLite header without opening a connection or WAL sidecar."""
+    validated = validate_durable_sqlite_path(db_path, field=field)
+    resolved = Path(validated).resolve()
+    if not stat.S_ISREG(resolved.stat().st_mode):
+        raise OSError("Database path is not a regular file")
+    with resolved.open("rb") as database_file:
+        header = database_file.read(100)
+    if header[:16] != b"SQLite format 3\x00":
+        return "not_sqlite"
+    return "wal" if header[18:20] == b"\x02\x02" else "delete"

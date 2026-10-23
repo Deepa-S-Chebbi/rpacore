@@ -14,7 +14,7 @@ Start here:
   timing, schema versions, migrations, recovery, and queue persistence.
 - [API Reference](api.md): supported top-level imports from `rpacore`.
 - [CLI Reference](cli.md): `rpacore init`, `run`, `doctor`, `version`, and
-  transaction inspection/export commands.
+  transaction inspection/export and read-only queue inspection commands.
 - [Configuration Reference](config.md): `rpacore.toml`, `config.toml`, path
   resolution, queue settings, notifications, and credentials.
 - [Project Manifest Reference](project-manifest.md): `rpacore.toml` schema and

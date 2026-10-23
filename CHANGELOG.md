@@ -6,6 +6,11 @@ All notable user-facing changes are recorded here.
 
 ### Added
 
+- Read-only queue item, attempt and poison inspection through top-level query
+  functions and `rpacore queue list/show/attempts/poison`. Bounded keyset pages
+  and queue-specific JSON v1 omit payloads/tokens from CLI output. Inspection
+  requires current schemas, refuses WAL, and never creates, migrates, reclaims
+  or quarantines storage. No migration or examples-project change is required.
 - `doctor` offers nonfatal, privacy-bounded guidance for likely root, queue and
   notification setting typos and divergent explicit config/manifest transaction
   paths. Doctor-v1 config details optionally include ordered advisory codes,

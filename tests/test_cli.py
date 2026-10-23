@@ -266,6 +266,11 @@ class TestCliDoctor:
         checks = {c["id"]: c for c in json.loads(result.stdout)["checks"]}
         assert checks[f"{component}.schema"]["status"] == "fail"
         assert checks[f"{component}.schema"]["details"] == {}
+        if component == "queue" and kind == "non_sqlite":
+            assert checks["queue.health"] == {
+                "id": "queue.health", "status": "not_applicable",
+                "summary": "Queue database is not an SQLite database", "details": {},
+            }
         assert {p: p.read_bytes() for p in project.rglob("*") if p.is_file()} == before
 
     @pytest.mark.parametrize("target", ["manifest", "config", "database"])
@@ -401,7 +406,7 @@ class TestCliDoctor:
         monkeypatch.setattr(Path, "stat", nonregular)
         monkeypatch.setattr(Path, "open", must_not_open)
         with pytest.raises(OSError, match="not a regular file"):
-            doctor_module._database_header_journal_mode(str(path), field="test")
+            doctor_module.database_header_journal_mode(str(path), field="test")
 
     @pytest.mark.parametrize("exception", [PermissionError("private-marker"), RuntimeError("private-marker")])
     def test_config_stat_failures_remain_bounded(self, tmp_path, monkeypatch, exception):
@@ -599,9 +604,13 @@ class TestCliDoctor:
         assert checks["queue.schema"]["status"] == "pass"
         assert checks["queue.health"]["details"]["pending_items"] == 1
 
-    def test_wal_database_sidecars_are_not_changed(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize("component", ["transactions", "queue"])
+    def test_wal_database_sidecars_are_not_changed(self, tmp_path: Path, component: str) -> None:
         db_path = tmp_path / "wal.db"
-        save_transaction(Transaction(reference="doctor"), str(db_path))
+        if component == "queue":
+            SqliteQueue({"db_path": str(db_path)}).add(QueueItem(reference="doctor", payload={}))
+        else:
+            save_transaction(Transaction(reference="doctor"), str(db_path))
         connection = sqlite3.connect(db_path)
         try:
             assert connection.execute("PRAGMA journal_mode = WAL").fetchone()[0] == "wal"
@@ -611,16 +620,22 @@ class TestCliDoctor:
             assert all(path.exists() for path in sidecars)
             before = {path: path.read_bytes() for path in sidecars}
 
-            result = collect_doctor_result(transaction_db_path=str(db_path))
+            if component == "queue":
+                result = collect_doctor_result(queue_db_path=str(db_path))
+            else:
+                result = collect_doctor_result(transaction_db_path=str(db_path))
 
             assert {path: path.read_bytes() for path in sidecars} == before
         finally:
             connection.close()
         checks = {check.id: check for check in result.checks}
-        assert checks["transactions.journal"].status == "warning"
-        assert checks["transactions.schema"].status == "not_applicable"
-        assert checks["transactions.schema"].details == {}
-        assert checks["transactions.quick_check"].status == "not_applicable"
+        assert checks[f"{component}.journal"].status == "warning"
+        assert checks[f"{component}.schema"].status == "not_applicable"
+        assert checks[f"{component}.schema"].details == {}
+        assert checks[f"{component}.quick_check"].status == "not_applicable"
+        if component == "queue":
+            assert checks["queue.health"].status == "not_applicable"
+            assert checks["queue.health"].summary == "WAL queue database was not opened"
 
     def test_malformed_foreign_key_is_a_structured_json_failure(self, tmp_path: Path) -> None:
         db_path = tmp_path / "foreign-key-mismatch.db"

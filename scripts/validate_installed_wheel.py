@@ -33,15 +33,17 @@ _FROZEN_PUBLIC_EXPORTS = (
     "HistoryEntry", "HistoryEvent",
     "KeyringCredentialProvider", "Notifier", "OutcomeCategory", "OutcomeReport",
     "ProcessContext", "ProjectManifest", "QueueAdminEvent", "QueueAttempt",
-    "QueueAttemptOutcome", "QueueItem", "QueueLeaseLostError", "QueuePoisonEvent",
+    "QueueAttemptOutcome", "QueueItem", "QueueLeaseLostError", "QueuePage",
+    "QueuePoisonEvent",
     "QueueProvider", "QueueRunSummary", "QueueStatus", "ReportRecord",
     "RetryDisposition", "SqliteQueue", "Status", "Step", "StepReport",
     "SystemException", "TRANSACTION_FORMAT_VERSION", "Transaction", "TransactionFenceError",
     "TransactionPage", "TransactionReport", "TransactionSummary", "WebhookNotifier",
     "atomic_output_path", "bind_log_context", "build_credential_provider", "build_notifiers",
     "configure_logger", "dispatch", "execute_transaction", "find_project_manifest",
-    "generate_report", "get_logger", "list_transactions", "load_config",
-    "load_project_manifest", "load_transaction", "optional_config", "query_transactions",
+    "generate_report", "get_logger", "get_queue_item", "list_transactions", "load_config",
+    "load_project_manifest", "load_transaction", "optional_config", "query_queue_attempts",
+    "query_queue_items", "query_queue_poison_events", "query_transactions",
     "render_html", "render_json", "render_text", "require_config", "require_section",
     "resolve_config_path", "resolve_config_paths", "resolve_project_entrypoint",
     "resume_transaction", "run_queue_loop", "save_transaction", "serialize_transaction",
@@ -280,7 +282,11 @@ print(f"Python {{platform.python_version()}}; SQLite {{sqlite3.sqlite_version}}"
 
 def _typing_consumer_code() -> str:
     return """\
-from rpacore import Engine, ExecutionTransition, ProcessContext, Transaction, optional_config, require_config
+from rpacore import (
+    Engine, ExecutionTransition, ProcessContext, Transaction, optional_config, require_config,
+    QueueAttempt, QueueItem, QueuePage, QueuePoisonEvent, get_queue_item,
+    query_queue_items, query_queue_attempts, query_queue_poison_events,
+)
 
 config: dict[str, object] = {"retries": 2, "label": "ready"}
 retries: int = require_config(config, "retries", int)
@@ -303,6 +309,15 @@ transition_record: dict[str, object] = transitions[-1].to_record()
 assert config_retries == state_retries
 assert state_label == label
 assert transition_record["schema_version"] == 2
+
+def queue_types(path: str) -> None:
+    item: QueueItem | None = get_queue_item("opaque id", path)
+    items: QueuePage[QueueItem] = query_queue_items(path)
+    attempts: QueuePage[QueueAttempt] = query_queue_attempts(path)
+    poison: QueuePage[QueuePoisonEvent] = query_queue_poison_events(path)
+    records: tuple[QueueItem, ...] = items.records
+    assert item is None or isinstance(item, QueueItem)
+    assert isinstance(records, tuple) and attempts.format_version == poison.format_version
 """
 
 
@@ -334,6 +349,50 @@ def run(command, cwd):
     result = subprocess.run(command, cwd=cwd, capture_output=True, text=True)
     assert result.returncode == 0, (command, result.stdout, result.stderr)
     return result
+
+# The installed console script and top-level APIs inspect disposable queue storage.
+from contextlib import closing
+from rpacore import (
+    QueueItem, QueuePage, SqliteQueue, get_queue_item, query_queue_items,
+    query_queue_attempts, query_queue_poison_events,
+)
+queue_path = root / "inspection-queue.db"
+queue = SqliteQueue({"db_path": str(queue_path)})
+queue.add(QueueItem(id="opaque item", reference="queue-smoke", payload={"secret": "payload-secret"}))
+queue.add(QueueItem(id="poison item", reference="queue-poison", payload={}))
+with closing(sqlite3.connect(queue_path)) as connection, connection:
+    connection.execute("UPDATE queue_items SET payload='not-json' WHERE id='poison item'")
+claimed = queue.next_item("wheel-worker")
+assert claimed is not None
+assert queue.next_item("wheel-worker") is None  # quarantines the fixture's malformed row
+with closing(sqlite3.connect(queue_path)) as connection, connection:
+    connection.execute("UPDATE queue_items SET payload='{}' WHERE id='poison item'")
+assert get_queue_item("opaque item", str(queue_path)).claim_token == claimed.claim_token
+assert isinstance(query_queue_items(str(queue_path)), QueuePage)
+assert len(query_queue_attempts(str(queue_path)).records) == 1
+assert len(query_queue_poison_events(str(queue_path)).records) == 1
+before_queue = {p: p.read_bytes() for p in root.glob("inspection-queue.db*")}
+console = [str(Path(sys.executable).parent / ("rpacore.exe" if os.name == "nt" else "rpacore"))]
+for command in ("list", "show", "attempts", "poison"):
+    selector = ["opaque item"] if command == "show" else []
+    for json_flag in ([], ["--json"]):
+        result = run(console + ["queue", command, *selector, "--db", str(queue_path), *json_flag], root)
+        assert result.stdout and result.stderr == "", (command, result)
+        assert "payload-secret" not in result.stdout and claimed.claim_token not in result.stdout
+        if json_flag:
+            payload = json.loads(result.stdout)
+            assert payload["schema_version"] == 1 and payload["command"] == "queue:" + command
+            assert payload["item"] if command == "show" else payload["records"]
+assert {p: p.read_bytes() for p in root.glob("inspection-queue.db*")} == before_queue
+for arguments, expected_code in (
+    (["show", "absent", "--db", str(queue_path)], 1),
+    (["list", "--db", str(root / "missing-queue.db")], 1),
+    (["list", "--limit", "1001"], 2),
+    (["list", "--db", str(queue_path), "--cursor", "bad"], 1),
+):
+    result = subprocess.run(console + ["queue", *arguments, "--json"], cwd=root, capture_output=True, text=True)
+    assert result.returncode == expected_code and result.stdout == "" and result.stderr, result
+print("Installed read-only queue APIs and console commands passed")
 
 for name in (
     "my project", ".demo", "demo.", "_demo", "demo_", "-demo", "demo-",
@@ -459,7 +518,7 @@ recipe_files = __RECOVERY_RECIPE_FILES__
 for name, source in recipe_files.items():
     (replay_project / name).write_text(source, encoding="utf-8")
 run([sys.executable, "-m", "build", "--no-isolation", "--wheel", "--outdir", str(root / "recovery-wheels")], replay_project)
-run([sys.executable, "-m", "pytest", "tests/test_greeting_step.py", "-q"], replay_project)
+run([sys.executable, "-m", "pytest", "tests/test_greeting_step.py", "-q", "--basetemp", str(replay_project / ".pytest-tmp")], replay_project)
 replay_db = replay_project / "rpacore.db"
 doctor = json.loads(run(cli + ["doctor", "--json"], replay_project).stdout)
 assert not replay_db.exists()

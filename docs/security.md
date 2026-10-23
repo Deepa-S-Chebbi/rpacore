@@ -35,6 +35,14 @@ content:
 - screenshots captured on exception
 - webhook payloads and email messages
 
+Queue inspection library functions return full records: item payloads and
+item/attempt claim tokens remain sensitive. Do not log or forward them wholesale.
+The [queue CLI](cli.md#queue-commands) projects an allowlist that omits payloads,
+tokens, config and raw exception messages. IDs, references, worker names and
+transaction IDs remain visible and can contain application data. Apply access
+controls and retention to captured human/JSON output. A cursor carries only a
+position and filter identity; it grants no storage access and is not a snapshot.
+
 RPA Core does not persist `ProcessContext.resources` and does not serialize
 credential provider objects. That protection depends on users keeping runtime
 clients, sessions, handles, and secrets in `ctx.resources` or credential

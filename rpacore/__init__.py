@@ -38,6 +38,13 @@ from rpacore.persistence import (
     query_transactions,
     save_transaction,
 )
+from rpacore._queue_read import (
+    QueuePage,
+    get_queue_item,
+    query_queue_attempts,
+    query_queue_items,
+    query_queue_poison_events,
+)
 from rpacore.queue import (
     QueueAdminEvent,
     QueueAttempt,
@@ -84,6 +91,7 @@ __all__ = [
     "QueueAttemptOutcome",
     "QueueItem",
     "QueueLeaseLostError",
+    "QueuePage",
     "QueuePoisonEvent",
     "QueueProvider",
     "QueueRunSummary",
@@ -112,11 +120,15 @@ __all__ = [
     "find_project_manifest",
     "generate_report",
     "get_logger",
+    "get_queue_item",
     "list_transactions",
     "load_config",
     "load_project_manifest",
     "load_transaction",
     "optional_config",
+    "query_queue_attempts",
+    "query_queue_items",
+    "query_queue_poison_events",
     "query_transactions",
     "render_html",
     "render_json",

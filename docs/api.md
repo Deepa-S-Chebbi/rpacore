@@ -239,8 +239,32 @@ summary prose is for people rather than semantic parsing.
 
 | Symbol | Purpose | Side effects |
 | --- | --- | --- |
+| `get_queue_item(item_id, db_path)` | Return a persisted `QueueItem`, or `None` if absent. IDs are opaque nonblank strings. | Always read-only; the database path is required. |
+| `QueuePage`, `query_queue_items(db_path, *, statuses=None, cursor=None, limit=100)`, `query_queue_attempts(db_path, *, item_id=None, cursor=None, limit=100)`, `query_queue_poison_events(db_path, *, item_id=None, cursor=None, limit=100)` | One typed page of items, claim attempts or poison events. | Always read-only; never creates, migrates, reclaims or quarantines. Requires existing current-schema storage and refuses WAL before opening SQLite. |
 | `QueueItem`, `QueueStatus`, `QueueLeaseLostError`, `QueueAdminEvent`, `QueueAttempt`, `QueueAttemptOutcome`, `QueuePoisonEvent`, `QueueProvider`, `SqliteQueue` | Queue item model, statuses, claim-loss error, audited overrides, attempt/disposition records, provider contract, and SQLite implementation. | `SqliteQueue` creates/migrates and mutates SQLite queue state. Every claim receives an opaque `claim_token`; claimed-worker mutations require the current token. Its `fail()` returns the durable `retry_scheduled` or `failed` attempt disposition; custom providers may return `None` when they cannot attest it. `list_attempts()` exposes one final outcome per post-v4 claim without fabricating history for older rows. |
 | `QueueRunSummary`, `run_queue_loop` | Process claimed queue items through user factories and `Engine`. Fatal `MemoryError`, `KeyboardInterrupt`, and `SystemExit` signals propagate after deterministic cleanup. | `processed` and `failed` remain compatibility aggregates. Use `retry_scheduled`, `terminal_failed`, `lease_lost`, and `transition_unknown` for disposition truth; unknown is never inferred from a requested retry flag. Mutates queue and transaction SQLite databases; renews leases; checkpoints transactions when `transaction_db_path` is configured. Durable queue checkpoints require `SqliteQueue` and atomically validate its claim token plus transaction revision. Every post-claim exit stops and joins its lease heartbeat. |
+
+`QueuePage[T]` has `records: tuple[T, ...]`, `has_more: bool`,
+`next_cursor: str | None` and `format_version: int` (currently `1`). Limits are
+integers from 1 through 1000. Item `statuses` takes a union of `QueueStatus`
+values: `None` selects all, an empty iterable selects none, and repetitions or
+reordering do not change cursor identity. Event `item_id` selectors use exact
+equality; no selector means all events. Unknown selectors return an empty page.
+
+Items sort by persisted `(created_at, id)` text ascending; events sort by
+sequence ascending. Cursors are opaque, versioned and bound to the query kind
+and normalized filters; malformed, unsupported or mismatched cursors raise
+`ValueError`. Pass them back to the same query with the same filters. Each call
+returns one page and closes its connection. Pages are current reads, not a
+global snapshot: filter changes or new/backdated rows behind the cursor require
+a fresh traversal. Complete enumeration requires quiescent storage.
+
+Library reads return full records, including item **payloads and claim tokens**
+and attempt **claim tokens**. Treat them as sensitive; the
+[queue CLI](cli.md#queue-commands) uses minimized projections instead. Invalid
+payloads fail item decoding without quarantine or partial results; attempts and
+poison events remain independently inspectable. No attempt history is invented
+for pre-tracking rows. Storage errors propagate without repair or migration.
 
 ## Manifest and Project Entrypoints
 

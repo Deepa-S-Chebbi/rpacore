@@ -428,6 +428,33 @@ Persisted step arguments replace fresh constructor arguments during recovery.
 Atomic artifact publication and SQLite checkpoints are separate commits;
 application effects must tolerate replay across that gap.
 
+## Read-only Queue Inspection
+
+`get_queue_item`, `query_queue_items`, `query_queue_attempts` and
+`query_queue_poison_events`, and the [queue CLI](cli.md#queue-commands), open only
+existing storage through SQLite read-only URI connections. Inspection requires
+the current queue schema and compatible component markers. It does not create,
+migrate, claim, reclaim expired leases, quarantine payloads or repair storage.
+Missing/older/future/unknown schemas and malformed storage fail visibly. WAL is
+refused by a file-header probe before opening SQLite; hot-journal recovery and
+blocking locks fail without changing database or sidecar bytes.
+
+One page uses a bounded limit-plus-one read and releases its connection before
+returning. Items follow persisted `(created_at, id)` text order ascending;
+attempts and poison events follow sequence ascending. Filter-bound keyset
+cursors avoid offset shifts when workers claim earlier items. Separate pages
+are not one global snapshot: items newly eligible behind a cursor, new/backdated
+rows and status changes can require a fresh traversal, even for terminal status
+filters because administrative overrides can change them. Complete audit
+enumeration needs separately obtained quiescent storage. Reads report persisted
+facts without inferring lease validity or future delivery time.
+
+Invalid payloads fail item decoding without quarantine; attempts and poison
+events remain independently readable. Existing `SqliteQueue` construction and
+read methods retain their writable schema-assurance policy and unbounded list
+defaults; use the explicit read-only functions for nonmutating inspection.
+No database migration or examples-project adoption is required.
+
 ## Transaction Persistence
 
 Transaction history is written through:

@@ -13,6 +13,19 @@ from typing import Iterable, Protocol, runtime_checkable
 
 from rpacore._clock import _Clock, _SYSTEM_CLOCK
 from rpacore._json_state import JsonStateError, validate_json_object
+from rpacore._queue_read import (
+    ATTEMPT_SELECT,
+    ATTEMPT_ORDER,
+    ITEM_SELECT,
+    ITEM_ORDER,
+    POISON_SELECT,
+    POISON_ORDER,
+    load_payload,
+    row_to_attempt,
+    row_to_item,
+    row_to_poison_event,
+    status_filter_clause,
+)
 from rpacore._sqlite import (
     SCHEMA_VERSION_TABLE,
     QUEUE_SCHEMA_VERSION,
@@ -289,36 +302,6 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             )
 
 
-def _load_payload(raw_payload: str) -> dict[str, object]:
-    payload = json.loads(raw_payload)
-    validate_json_object(payload, path="queue item payload")
-    return payload
-
-
-def _row_to_item(row: sqlite3.Row, *, payload: dict[str, object] | None = None) -> QueueItem:
-    claimed_at = None
-    if row["claimed_at"]:
-        claimed_at = datetime.fromisoformat(row["claimed_at"])
-    if payload is None:
-        payload = _load_payload(row["payload"])
-    return QueueItem(
-        id=row["id"],
-        reference=row["reference"],
-        payload=payload,
-        status=QueueStatus(row["status"]),
-        retry_count=row["retry_count"],
-        created_at=datetime.fromisoformat(row["created_at"]),
-        claimed_by=row["claimed_by"],
-        claimed_at=claimed_at,
-        claim_token=row["claim_token"],
-        transaction_id=row["transaction_id"],
-    )
-
-
-def _status_values(statuses: Iterable[QueueStatus]) -> list[str]:
-    return [status.value for status in statuses]
-
-
 def _limit_offset_clause(*, limit: int | None, offset: int) -> tuple[str, list[int]]:
     if isinstance(limit, bool) or (limit is not None and not isinstance(limit, int)):
         raise type_error("queue.list_items.limit", "int | None", limit)
@@ -334,16 +317,6 @@ def _limit_offset_clause(*, limit: int | None, offset: int) -> tuple[str, list[i
             return "", []
         return " LIMIT -1 OFFSET ?", [offset]
     return " LIMIT ? OFFSET ?", [limit, offset]
-
-
-def _status_filter_clause(statuses: Iterable[QueueStatus] | None) -> tuple[str, list[str]]:
-    if statuses is None:
-        return "", []
-    status_values = _status_values(statuses)
-    if not status_values:
-        return " AND 1=0", []
-    placeholders = ", ".join("?" for _ in status_values)
-    return f" AND status IN ({placeholders})", status_values
 
 
 def _insert_item(conn: sqlite3.Connection, item: QueueItem) -> None:
@@ -485,9 +458,9 @@ class SqliteQueue:
             with conn:
                 _ensure_schema(conn)
             row = conn.execute(
-                "SELECT * FROM queue_items WHERE id = ?", (item_id,)
+                f"{ITEM_SELECT} WHERE id = ?", (item_id,)
             ).fetchone()
-            return _row_to_item(row) if row else None
+            return row_to_item(row) if row else None
         finally:
             conn.close()
 
@@ -509,7 +482,7 @@ class SqliteQueue:
         offset: int = 0,
     ) -> list[QueueItem]:
         """Return queue items, optionally filtered by status, in deterministic order."""
-        status_filter, status_values = _status_filter_clause(statuses)
+        status_filter, status_values = status_filter_clause(statuses)
         limit_clause, limit_params = _limit_offset_clause(limit=limit, offset=offset)
 
         conn = _connect(self.db_path)
@@ -517,11 +490,11 @@ class SqliteQueue:
             with conn:
                 _ensure_schema(conn)
             rows = conn.execute(
-                "SELECT * FROM queue_items WHERE 1=1"
-                f"{status_filter} ORDER BY created_at ASC, id ASC{limit_clause}",
+                f"{ITEM_SELECT} WHERE 1=1"
+                f"{status_filter} ORDER BY {ITEM_ORDER}{limit_clause}",
                 [*status_values, *limit_params],
             ).fetchall()
-            return [_row_to_item(row) for row in rows]
+            return [row_to_item(row) for row in rows]
         finally:
             conn.close()
 
@@ -532,7 +505,7 @@ class SqliteQueue:
         statuses: Iterable[QueueStatus] | None = None,
     ) -> bool:
         """Return True when a queue item exists for reference and optional statuses."""
-        status_filter, status_values = _status_filter_clause(statuses)
+        status_filter, status_values = status_filter_clause(statuses)
 
         conn = _connect(self.db_path)
         try:
@@ -553,7 +526,7 @@ class SqliteQueue:
         active_statuses: Iterable[QueueStatus] | None = (QueueStatus.PENDING, QueueStatus.IN_PROGRESS),
     ) -> bool:
         """Insert item unless another item with the same reference is active."""
-        status_filter, status_values = _status_filter_clause(active_statuses)
+        status_filter, status_values = status_filter_clause(active_statuses)
         conn = _connect(self.db_path)
         transaction_started = False
         try:
@@ -640,7 +613,7 @@ class SqliteQueue:
                     return None
 
                 try:
-                    payload = _load_payload(row["payload"])
+                    payload = load_payload(row["payload"])
                 except (json.JSONDecodeError, JsonStateError) as exc:
                     conn.execute("BEGIN IMMEDIATE")
                     transaction_started = True
@@ -688,7 +661,7 @@ class SqliteQueue:
                 updated = conn.execute(
                     "SELECT * FROM queue_items WHERE id = ?", (row["id"],)
                 ).fetchone()
-                return _row_to_item(updated, payload=payload)
+                return row_to_item(updated, payload=payload)
         except Exception:
             if transaction_started:
                 conn.execute("ROLLBACK")
@@ -931,28 +904,15 @@ class SqliteQueue:
             with conn:
                 _ensure_schema(conn)
             if item_id is None:
-                rows = conn.execute("SELECT * FROM queue_attempts ORDER BY sequence").fetchall()
+                rows = conn.execute(
+                    f"{ATTEMPT_SELECT} ORDER BY {ATTEMPT_ORDER}"
+                ).fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT * FROM queue_attempts WHERE item_id = ? ORDER BY sequence",
+                    f"{ATTEMPT_SELECT} WHERE item_id = ? ORDER BY {ATTEMPT_ORDER}",
                     (item_id,),
                 ).fetchall()
-            return [
-                QueueAttempt(
-                    sequence=row["sequence"],
-                    item_id=row["item_id"],
-                    claim_token=row["claim_token"],
-                    claimed_by=row["claimed_by"],
-                    started_at=datetime.fromisoformat(row["started_at"]),
-                    finished_at=(
-                        datetime.fromisoformat(row["finished_at"])
-                        if row["finished_at"]
-                        else None
-                    ),
-                    outcome=(QueueAttemptOutcome(row["outcome"]) if row["outcome"] else None),
-                )
-                for row in rows
-            ]
+            return [row_to_attempt(row) for row in rows]
         finally:
             conn.close()
 
@@ -963,20 +923,14 @@ class SqliteQueue:
             with conn:
                 _ensure_schema(conn)
             if item_id is None:
-                rows = conn.execute("SELECT * FROM queue_poison_events ORDER BY sequence").fetchall()
+                rows = conn.execute(
+                    f"{POISON_SELECT} ORDER BY {POISON_ORDER}"
+                ).fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT * FROM queue_poison_events WHERE item_id = ? ORDER BY sequence",
+                    f"{POISON_SELECT} WHERE item_id = ? ORDER BY {POISON_ORDER}",
                     (item_id,),
                 ).fetchall()
-            return [
-                QueuePoisonEvent(
-                    sequence=row["sequence"],
-                    item_id=row["item_id"],
-                    error_type=row["error_type"],
-                    created_at=datetime.fromisoformat(row["created_at"]),
-                )
-                for row in rows
-            ]
+            return [row_to_poison_event(row) for row in rows]
         finally:
             conn.close()

@@ -12,6 +12,8 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from rpacore import __version__
+from rpacore._queue_cli import _inspect_queue
+from rpacore._queue_read import QUERY_DEFAULT_LIMIT
 from rpacore._scaffold import _write_project_files
 from rpacore._transaction_cli import _inspect_transactions
 from rpacore.doctor import collect_doctor_result
@@ -84,6 +86,40 @@ def build_parser() -> argparse.ArgumentParser:
         help="Export format.",
     )
 
+    queue_parser = subparsers.add_parser(
+        "queue",
+        help="Inspect the local queue without modifying it.",
+    )
+    queue_subparsers = queue_parser.add_subparsers(
+        dest="queue_command",
+        required=True,
+    )
+    for name, help_text in (
+        ("list", "List queue items in creation order."),
+        ("show", "Show one queue item."),
+        ("attempts", "List claim attempts in durable sequence order."),
+        ("poison", "List malformed-payload dispositions in durable sequence order."),
+    ):
+        command_parser = queue_subparsers.add_parser(name, help=help_text)
+        command_parser.add_argument("--db", dest="db_path", help="Queue database path.")
+        command_parser.add_argument("--config", dest="config_path", help="Configuration file path.")
+        command_parser.add_argument("--json", action="store_true", help="Write JSON to stdout.")
+        if name == "show":
+            command_parser.add_argument("item_id", help="Queue item id to inspect.")
+        else:
+            command_parser.add_argument(
+                "--limit", type=_positive_int, default=QUERY_DEFAULT_LIMIT,
+                help=f"Maximum records to list. Defaults to {QUERY_DEFAULT_LIMIT}.",
+            )
+            command_parser.add_argument("--cursor", help="Continue with the same filters.")
+            if name == "list":
+                command_parser.add_argument(
+                    "--status", action="append", default=[],
+                    help="Item status to include; repeat for a union (pending, in_progress, successful, failed).",
+                )
+            else:
+                command_parser.add_argument("item_id", nargs="?", help="Optional exact queue item id selector.")
+
     doctor_parser = subparsers.add_parser(
         "doctor",
         help="Inspect local runtime and storage without modifying them.",
@@ -113,6 +149,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_project()
     if args.command == "transaction":
         return _inspect_transactions(args)
+    if args.command == "queue":
+        return _inspect_queue(args)
     if args.command == "doctor":
         return _run_doctor(args)
     parser.error(f"unknown command: {args.command}")

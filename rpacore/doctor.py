@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import platform
 import sqlite3
-import stat
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
 
 from rpacore import __version__
 from rpacore._doctor_check import (
@@ -18,9 +16,9 @@ from rpacore._sqlite import (
     QUEUE_SCHEMA_VERSION,
     TRANSACTION_SCHEMA_VERSION,
     connect_sqlite,
+    database_header_journal_mode,
     ensure_database_compatibility,
     require_current_schema,
-    validate_durable_sqlite_path,
 )
 from rpacore.manifest import ProjectManifest, find_project_manifest, load_project_manifest
 
@@ -140,7 +138,7 @@ def _database_checks(
     if db_path is None:
         return _not_applicable_database_checks(prefix, f"No {label.lower()} database selected")
     try:
-        header_journal_mode = _database_header_journal_mode(
+        header_journal_mode = database_header_journal_mode(
             db_path,
             field=f"doctor.{component}_db_path",
         )
@@ -260,22 +258,9 @@ def _wal_database_checks(prefix: str, label: str) -> list[DoctorCheck]:
     ]
 
 
-def _database_header_journal_mode(db_path: str, *, field: str) -> str:
-    """Read the SQLite header without opening a connection or WAL sidecar."""
-    validated = validate_durable_sqlite_path(db_path, field=field)
-    resolved = Path(validated).resolve()
-    if not stat.S_ISREG(resolved.stat().st_mode):
-        raise OSError("Database path is not a regular file")
-    with resolved.open("rb") as database_file:
-        header = database_file.read(100)
-    if header[:16] != b"SQLite format 3\x00":
-        return "not_sqlite"
-    return "wal" if header[18:20] == b"\x02\x02" else "delete"
-
-
 def _queue_health_check(db_path: str) -> DoctorCheck:
     try:
-        header_journal_mode = _database_header_journal_mode(
+        header_journal_mode = database_header_journal_mode(
             db_path,
             field="doctor.queue_db_path",
         )

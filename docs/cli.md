@@ -196,6 +196,92 @@ Exit codes:
 - `1`: one or more checks failed
 - `2`: invalid command syntax
 
+## Queue Commands
+
+```bash
+rpacore queue list --db path/to/queue.db --json
+rpacore queue show ITEM_ID --config path/to/config.toml
+rpacore queue attempts [ITEM_ID] --db path/to/queue.db --json
+rpacore queue poison [ITEM_ID] --db path/to/queue.db --json
+rpacore queue list --status pending --status failed --limit 20 --cursor TOKEN
+```
+
+All four commands inspect existing storage without creating, migrating,
+reclaiming expired leases, quarantining malformed payloads, or repairing it.
+The queue schema must already be current, and all framework components must be
+compatible. WAL databases are refused before SQLite is opened, preserving their
+sidecars; locks and hot journals requiring recovery fail visibly. Migrate or
+recover through the owning application before inspecting.
+
+Every command accepts `--db`, `--config`, and `--json`. Selection order is:
+
+1. `--db` selects a working-directory-relative or absolute queue database and
+   bypasses all manifest/config loading, even when `--config` is supplied.
+2. Otherwise `--config` selects a working-directory-relative or absolute config
+   and needs no project manifest.
+3. Otherwise discover the nearest `rpacore.toml` searching upward from the
+   working directory, validate it without importing the entrypoint, and use its
+   sibling `config.toml`.
+
+The selected config must contain `[queue].db_path`; relative queue paths resolve
+against that config's directory. There is no implicit working-directory config
+or queue fallback. Missing selection, malformed manifest, missing/unreadable/
+invalid config and missing selected storage fail with `1`. Unlike
+`doctor --queue-db`, queue inspection uses `--db`, bypasses config completely
+when it is supplied, and always fails for missing selected storage.
+
+`list` accepts repeated `--status` values forming a union of `pending`,
+`in_progress`, `successful`, and `failed`; omission selects all items. `show`
+requires an ID; `attempts` and `poison` accept an optional exact ID selector.
+IDs are opaque nonblank strings; hex, hyphenated and application IDs are valid.
+An absent `show` item returns `1`; empty queries, including events for unknown
+IDs, succeed with `0`.
+
+The three page commands accept `--limit` (default 100, range 1–1000) and
+`--cursor`. Each invocation returns one page without auto-draining. Items sort
+by persisted `(created_at, id)` text ascending, without UTC normalization;
+events sort by sequence ascending. Human output identifies truncation and gives
+the continuation token. Continue with the same filters while `has_more` is true.
+Each page is a point-in-time read, not a global snapshot: claims can remove
+eligible rows; new/backdated rows or items entering a filter behind the cursor
+require a fresh traversal. Complete audit enumeration needs quiescent storage.
+
+Invalid status, limit or blank ID arguments return `2` before storage selection.
+Malformed, unsupported, wrong-kind or changed-filter cursors return `1`, as do
+storage, decoding and serialization failures. Failures leave stdout empty;
+bounded error categories and corrective guidance go to stderr without raw
+config, stored diagnostic content or exception messages. Item decode failures
+do not quarantine data; attempts/poison can still be inspected independently.
+
+### Queue machine-readable compatibility
+
+Queue JSON has its own `schema_version: 1`, independent of transaction/export
+formats. Page envelopes have exactly these fields:
+
+```json
+{"schema_version":1,"command":"queue:list","limit":100,"records":[],"has_more":false,"next_cursor":null}
+```
+
+`command` is `queue:list`, `queue:attempts` or `queue:poison`; `limit` is an
+integer, `records` an array, `has_more` a boolean and `next_cursor` a string when
+more records exist, otherwise null. Show has exactly `schema_version`,
+`command: "queue:show"`, and `item` (one item projection).
+
+| Record | Exact fields and types |
+| --- | --- |
+| Item (`list` and `show`) | `id`, `reference`, `status`, `created_at`, `claimed_by`, `transaction_id`: strings; `retry_count`: integer; `claimed_at`: string or null. `status` is `pending`, `in_progress`, `successful` or `failed`. Empty worker/transaction strings mean unassigned/unbound. |
+| Attempt | `sequence`: integer; `item_id`, `claimed_by`, `started_at`: strings; `finished_at`: string or null; `outcome`: string or null. Outcomes are `successful`, `retry_scheduled`, `failed`, `lease_expired`, `admin_override`; null denotes an open attempt. |
+| Poison event | `sequence`: integer; `item_id`, `error_type`, `created_at`: strings. `error_type` is the recorded parser error type, not an error message. |
+
+Timestamps are ISO-8601 strings from persisted records. Projections omit payloads,
+claim tokens, configuration and raw error messages in both human and JSON output.
+Allowlisted references, IDs and worker names can still contain application data;
+protect captured output. Full library records carry payloads/tokens. Cursors
+contain no payload or token and are versioned continuation positions, not
+authorization or completeness guarantees. Framework fields are closed for each
+version; consumers should check `schema_version`. Checked compatibility examples
+live under `tests/fixtures/record-contracts/cli-queue-*-v1.json`.
+
 ## Transaction Commands
 
 Transaction commands inspect the SQLite database at `[storage].transaction_db_path`
