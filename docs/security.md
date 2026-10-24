@@ -147,6 +147,15 @@ control.
 Webhook timeouts bound socket operations after resolution starts; they do not
 fully control operating-system DNS latency.
 
+Notification dispatch retries selected transient failures up to three attempts,
+adding 1- and 2-second waits. Each attempt may incur transport timeouts; this
+is not an overall delivery deadline. Retries after an ambiguous acknowledgement
+can duplicate an email or webhook side effect. Receivers should deduplicate
+using transaction identity where needed. Exhaustion and process exit can still
+lose notifications: there is no durable outbox or replay guarantee. Permanent
+HTTP/SMTP errors and certificate verification failures are not retried, and TLS
+verification remains enabled. See the [notification API contract](api.md#credentials-logging-reports-and-notifications).
+
 Email notifications can attach screenshots referenced by reports when
 `attach_screenshots` is true. Missing or unreadable screenshot files are skipped.
 Reports and notification payloads include artifact records and paths, not

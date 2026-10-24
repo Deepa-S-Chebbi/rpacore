@@ -6,6 +6,14 @@ All notable user-facing changes are recorded here.
 
 ### Added
 
+- Notification dispatch retries selected transient SMTP/HTTP/socket failures
+  up to three attempts, with 1- and 2-second waits and attempt logs. Terminal
+  failure accounting and transaction outcomes remain separate. This replaces
+  dispatch's single attempt: delivery can duplicate and take longer; exhaustion
+  or process exit can still lose notifications. Direct notifier `send` remains
+  single-attempt and preserves readable HTTP error responses for caller-owned
+  cleanup; dispatch closes the errors it consumes. No schema migration,
+  dependency or examples update is needed.
 - Read-only queue item, attempt and poison inspection through top-level query
   functions and `rpacore queue list/show/attempts/poison`. Bounded keyset pages
   and queue-specific JSON v1 omit payloads/tokens from CLI output. Inspection

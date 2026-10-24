@@ -130,6 +130,12 @@ connections unrelated state.
 
 Notification settings are optional:
 
+`dispatch` automatically retries recognized transient transport failures up to
+three total attempts, with 1- and 2-second waits. No retry setting is required
+or supported. Direct notifier `send` calls remain single-attempt. See the
+[notification API contract](api.md#credentials-logging-reports-and-notifications)
+for retryable errors, failure accounting and best-effort delivery limits.
+
 ```toml
 [notification.email]
 host = "smtp.example.com"

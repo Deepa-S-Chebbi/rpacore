@@ -158,6 +158,40 @@ and the [existing-project edit](config.md#credential-selection-in-existing-proje
 | `ArtifactReport`, `OutcomeReport`, `ReportRecord`, `StepReport`, `TransactionReport`, `generate_report`, `render_json`, `render_html`, `render_text` | Build and render transaction reports. | `TransactionReport.outcome` directly projects captured terminal category, retry disposition, and optional failure code; it does not infer them from status, history, or queue attempts. `TransactionReport.record` is an immutable, JSON-safe report-v2 record; `render_json()` returns its canonical JSON. Report generation snapshots JSON-safe nested data and exceptions; rendering has no file I/O. |
 | `Notifier`, `EmailNotifier`, `WebhookNotifier`, `build_notifiers`, `dispatch` | Send notifications. | Dispatch gives each notifier an isolated report snapshot. SMTP or HTTP requests occur when configured. Payloads can contain sensitive transaction data. |
 
+`dispatch(notifiers, report, *, logger=None, on_failure=None)` makes at most
+three attempts per notifier, waiting 1 then 2 seconds after retryable failures.
+Every attempt receives a fresh isolated report snapshot. It retries HTTP
+408/429/500/502/503/504; SMTP response errors in 400-499, unexpected SMTP
+disconnects, or all-recipient refusal with only 400-499 codes; socket timeouts,
+connection errors and temporary DNS failures (`EAI_AGAIN`). For `URLError`, only
+those socket errors in its exception-valued `reason` qualify. Other failures,
+including permanent HTTP/SMTP responses, certificate verification errors and
+unknown/string reasons, stop immediately. Direct notifier `send(report)` calls
+remain single-attempt and propagate their errors. A direct webhook caller
+owns the propagated `HTTPError` response: its body stays readable, and the
+caller should close it when finished. Dispatch consumes and closes HTTP error
+responses before retrying or swallowing terminal failure.
+
+Retry warnings use `rpacore.notifier.retry` in JSON logs, with `notifier`,
+`attempt`, `max_attempts` and `wait_seconds` attributes. Terminal errors use
+`rpacore.notifier.error`, retaining exception evidence and actual attempt/max
+attributes. `on_failure` receives the notifier class name once for a terminal
+failure; successful retries do not call it. Ordinary notification, backoff and
+callback failures are contained so later notifiers and queue processing can
+continue. `MemoryError`, `KeyboardInterrupt` and `SystemExit` propagate.
+Notification retries do not re-execute steps or change transaction outcomes or
+transaction retry counts. Queue `notification_errors` counts terminal notifier
+failures, rather than individual attempts.
+
+This changes dispatch's previous single-attempt behavior: allow up to three
+seconds of extra synchronous waits plus transport time. There is no total
+deadline, configurable retry policy, jitter or `Retry-After` scheduling.
+Delivery is best-effort; an ambiguous acknowledgement may cause duplicates,
+while exhaustion or process exit may lose a notification. No durable outbox,
+delivery history or replay is provided. Use receiver-side deduplication with
+transaction identity, or own delivery directly through `send` when single-call
+control is needed. No schema migration or examples-project update is required.
+
 `ReportRecord` is report format v2: a frozen JSON-safe record formed once by
 `generate_report()`. `render_json()`, `render_text()`, and `render_html()` all
 derive their output from that record, so later mutation of the legacy

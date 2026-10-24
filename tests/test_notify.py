@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import smtplib
+import socket
 import ssl
 from datetime import datetime, timezone
 from email import message_from_string
@@ -12,6 +14,7 @@ from html.parser import HTMLParser
 from io import BytesIO, StringIO
 from pathlib import PureWindowsPath
 from unittest.mock import MagicMock, patch
+from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 
 import pytest
@@ -846,6 +849,252 @@ class TestWebhookNotifierSend:
 # ---------------------------------------------------------------------------
 
 class TestDispatch:
+    @pytest.mark.parametrize(
+        ("error", "retryable"),
+        [
+            pytest.param(
+                HTTPError("https://example.invalid", code, "synthetic", {}, None),
+                code in {408, 429, 500, 502, 503, 504},
+                id=f"http-{code}",
+            )
+            for code in [400, 401, 403, 404, 408, 429, 500, 501, 502, 503, 504, 505]
+        ] + [
+            (smtplib.SMTPDataError(451, b"temporary"), True),
+            (smtplib.SMTPConnectError(421, b"temporary"), True),
+            (smtplib.SMTPAuthenticationError(535, b"permanent"), False),
+            (smtplib.SMTPDataError(550, b"permanent"), False),
+            (smtplib.SMTPResponseException(399, b"unknown"), False),
+            (smtplib.SMTPResponseException(400, b"temporary"), True),
+            (smtplib.SMTPResponseException(499, b"temporary"), True),
+            (smtplib.SMTPResponseException(500, b"permanent"), False),
+            (smtplib.SMTPServerDisconnected("disconnected"), True),
+            (smtplib.SMTPNotSupportedError("unsupported"), False),
+            (smtplib.SMTPRecipientsRefused({"a": (450, b"temporary")}), True),
+            (smtplib.SMTPRecipientsRefused({"a": (450, b"temporary"), "b": (550, b"permanent")}), False),
+            (smtplib.SMTPRecipientsRefused({}), False),
+            (TimeoutError("timeout"), True),
+            (ConnectionResetError("reset"), True),
+            (ConnectionRefusedError("refused"), True),
+            (socket.gaierror(socket.EAI_AGAIN, "temporary DNS"), True),
+            (socket.gaierror(socket.EAI_NONAME, "permanent DNS"), False),
+            (URLError(TimeoutError("timeout")), True),
+            (URLError(ConnectionResetError("reset")), True),
+            (URLError(socket.gaierror(socket.EAI_AGAIN, "temporary DNS")), True),
+            (URLError(socket.gaierror(socket.EAI_NONAME, "permanent DNS")), False),
+            (URLError("timed out"), False),
+            (URLError(ssl.SSLCertVerificationError("untrusted")), False),
+            (ssl.SSLCertVerificationError("untrusted"), False),
+            (OSError("unknown OS failure"), False),
+            (ValueError("invalid configuration"), False),
+        ],
+    )
+    def test_transport_retry_boundary(self, error, retryable, monkeypatch):
+        sleep = MagicMock()
+        monkeypatch.setattr("time.sleep", sleep)
+        notifier = MagicMock(spec=Notifier)
+        notifier.send.side_effect = [error, None]
+        failed = []
+
+        dispatch([notifier], _make_report(), on_failure=failed.append)
+
+        assert notifier.send.call_count == (2 if retryable else 1)
+        assert failed == ([] if retryable else ["MagicMock"])
+        assert [call.args for call in sleep.call_args_list] == ([(1,)] if retryable else [])
+
+    @pytest.mark.parametrize("successful_attempt", [1, 2, 3, None])
+    def test_attempt_bound_waits_and_structured_terminal_accounting(
+        self, successful_attempt, monkeypatch
+    ):
+        sleep = MagicMock()
+        monkeypatch.setattr("time.sleep", sleep)
+        notifier = MagicMock(spec=Notifier)
+        notifier.send.side_effect = (
+            [TimeoutError("synthetic timeout")] * (successful_attempt - 1) + [None]
+            if successful_attempt is not None else TimeoutError("synthetic timeout")
+        )
+        following = MagicMock(spec=Notifier)
+        failed = []
+        stream = StringIO()
+        logger = configure_logger(name="rpacore.test.retry", fmt="json", stream=stream)
+
+        dispatch([notifier, following], _make_report(), logger=logger, on_failure=failed.append)
+
+        attempts = successful_attempt or 3
+        assert notifier.send.call_count == attempts
+        assert [c.args[0] for c in sleep.call_args_list] == list(range(1, attempts))
+        following.send.assert_called_once()
+        assert failed == ([] if successful_attempt else ["MagicMock"])
+        records = [json.loads(line) for line in stream.getvalue().splitlines()]
+        retries = [r for r in records if r["event"] == "rpacore.notifier.retry"]
+        assert [r["attributes"]["attempt"] for r in retries] == list(range(1, attempts))
+        assert [r["attributes"]["wait_seconds"] for r in retries] == list(range(1, attempts))
+        assert all(r["attributes"]["max_attempts"] == 3 for r in records)
+        assert all(r["severity"] == "warning" and "exception" not in r for r in retries)
+        terminal = [r for r in records if r["event"] == "rpacore.notifier.error"]
+        assert len(terminal) == (0 if successful_attempt else 1)
+        if terminal:
+            assert terminal[0]["attributes"]["attempt"] == 3
+            assert terminal[0]["exception"]["type"] == "TimeoutError"
+
+    def test_permanent_failure_after_retry_stops_early(self, monkeypatch):
+        sleep = MagicMock()
+        monkeypatch.setattr("time.sleep", sleep)
+        notifier = MagicMock(spec=Notifier)
+        notifier.send.side_effect = [TimeoutError(), ValueError("permanent"), None]
+        callback = MagicMock(side_effect=RuntimeError("callback failure"))
+        following = MagicMock(spec=Notifier)
+        log = MagicMock(spec=logging.Logger)
+
+        dispatch([notifier, following], _make_report(), logger=log, on_failure=callback)
+
+        assert notifier.send.call_count == 2
+        sleep.assert_called_once_with(1)
+        callback.assert_called_once_with("MagicMock")
+        following.send.assert_called_once()
+        assert log.exception.call_args_list[0].kwargs["extra"]["attempt"] == 2
+
+    def test_ordinary_wait_failure_is_contained(self, monkeypatch):
+        sleep = MagicMock(side_effect=OSError("wait failed"))
+        monkeypatch.setattr("time.sleep", sleep)
+        notifier = MagicMock(spec=Notifier)
+        notifier.send.side_effect = TimeoutError()
+        following = MagicMock(spec=Notifier)
+        callback = MagicMock()
+
+        dispatch([notifier, following], _make_report(), on_failure=callback)
+
+        notifier.send.assert_called_once()
+        sleep.assert_called_once_with(1)
+        callback.assert_called_once_with("MagicMock")
+        following.send.assert_called_once()
+
+    @pytest.mark.parametrize("fatal_type", [MemoryError, KeyboardInterrupt, SystemExit])
+    @pytest.mark.parametrize("source", ["later_attempt", "wait", "callback"])
+    def test_fatal_signal_propagates(self, fatal_type, source, monkeypatch):
+        sleep = MagicMock(side_effect=fatal_type() if source == "wait" else None)
+        monkeypatch.setattr("time.sleep", sleep)
+        notifier = MagicMock(spec=Notifier)
+        notifier.send.side_effect = (
+            RuntimeError("permanent") if source == "callback"
+            else [TimeoutError(), fatal_type()]
+        )
+        callback = MagicMock(side_effect=fatal_type() if source == "callback" else None)
+        following = MagicMock(spec=Notifier)
+
+        with pytest.raises(fatal_type):
+            dispatch([notifier, following], _make_report(), on_failure=callback)
+
+        following.send.assert_not_called()
+        assert notifier.send.call_count == (2 if source == "later_attempt" else 1)
+        assert callback.call_count == (1 if source == "callback" else 0)
+
+    @pytest.mark.parametrize("backend", ["webhook", "email"])
+    def test_real_adapter_recovery_and_direct_send_single_attempt(self, backend, monkeypatch):
+        monkeypatch.setattr("time.sleep", MagicMock())
+        notifier = WebhookNotifier(_webhook_config()) if backend == "webhook" else EmailNotifier(_email_config(), _creds())
+        target = "rpacore.notify.urllib.request.urlopen" if backend == "webhook" else "rpacore.notify.smtplib.SMTP"
+        with patch(target) as transport:
+            transport.side_effect = [TimeoutError(), MagicMock()]
+            callback = MagicMock()
+            dispatch([notifier], _make_report(), on_failure=callback)
+            assert transport.call_count == 2
+            callback.assert_not_called()
+
+            transport.reset_mock(side_effect=True)
+            transport.side_effect = TimeoutError()
+            with pytest.raises(TimeoutError):
+                notifier.send(_make_report())
+            transport.assert_called_once()
+
+    @pytest.mark.parametrize("status", [400, 503])
+    def test_direct_webhook_http_error_preserves_readable_body(self, status, monkeypatch):
+        body = BytesIO(b"synthetic endpoint diagnostic")
+        error = HTTPError("https://example.invalid", status, "synthetic", {}, body)
+        sleep = MagicMock()
+        monkeypatch.setattr("time.sleep", sleep)
+        notifier = WebhookNotifier(_webhook_config())
+
+        try:
+            with patch("rpacore.notify.urllib.request.urlopen", side_effect=error) as transport:
+                with pytest.raises(HTTPError) as caught:
+                    notifier.send(_make_report())
+            assert caught.value is error
+            transport.assert_called_once()
+            sleep.assert_not_called()
+            assert not body.closed
+            assert caught.value.read() == b"synthetic endpoint diagnostic"
+        finally:
+            error.close()
+
+    @pytest.mark.parametrize("status", [400, 503])
+    def test_dispatch_closes_webhook_error_before_retry_or_return(self, status, monkeypatch):
+        body = BytesIO(b"synthetic error response")
+        error = HTTPError("https://example.invalid", status, "synthetic", {}, body)
+        notifier = WebhookNotifier(_webhook_config())
+
+        def wait(_seconds):
+            assert body.closed
+
+        monkeypatch.setattr("time.sleep", wait)
+        with patch("rpacore.notify.urllib.request.urlopen", side_effect=[error, MagicMock()]) as transport:
+            callback = MagicMock()
+            dispatch([notifier], _make_report(), on_failure=callback)
+
+        assert body.closed
+        assert transport.call_count == (2 if status == 503 else 1)
+        assert callback.call_count == int(status == 400)
+
+    @pytest.mark.parametrize("error", [
+        smtplib.SMTPDataError(451, b"temporary"),
+        smtplib.SMTPRecipientsRefused({"admin@example.com": (450, b"temporary")}),
+        smtplib.SMTPServerDisconnected("disconnected"),
+    ])
+    def test_email_sendmail_transient_failure_recovers(self, error, monkeypatch):
+        sleep = MagicMock()
+        monkeypatch.setattr("time.sleep", sleep)
+        notifier = EmailNotifier(_email_config(), _creds())
+        callback = MagicMock()
+        with patch("rpacore.notify.smtplib.SMTP") as transport:
+            smtp = transport.return_value.__enter__.return_value
+            smtp.sendmail.side_effect = [error, {}]
+
+            dispatch([notifier], _make_report(), on_failure=callback)
+
+        assert transport.call_count == 2
+        assert smtp.sendmail.call_count == 2
+        assert smtp.starttls.call_count == smtp.login.call_count == 2
+        sleep.assert_called_once_with(1)
+        callback.assert_not_called()
+
+    @pytest.mark.parametrize("backend", ["webhook", "email"])
+    def test_real_adapter_terminal_identity_and_first_attempt_log(self, backend, monkeypatch):
+        sleep = MagicMock()
+        monkeypatch.setattr("time.sleep", sleep)
+        failed = []
+        stream = StringIO()
+        log = configure_logger(name=f"rpacore.test.terminal.{backend}", fmt="json", stream=stream)
+        if backend == "webhook":
+            notifier = WebhookNotifier(_webhook_config())
+            error = HTTPError("https://example.invalid", 400, "permanent", {}, BytesIO())
+            with patch("rpacore.notify.urllib.request.urlopen", side_effect=error) as transport:
+                dispatch([notifier], _make_report(), logger=log, on_failure=failed.append)
+        else:
+            notifier = EmailNotifier(_email_config(), _creds())
+            with patch("rpacore.notify.smtplib.SMTP") as transport:
+                smtp = transport.return_value.__enter__.return_value
+                smtp.sendmail.side_effect = smtplib.SMTPDataError(550, b"permanent")
+                dispatch([notifier], _make_report(), logger=log, on_failure=failed.append)
+            smtp.sendmail.assert_called_once()
+
+        transport.assert_called_once()
+        sleep.assert_not_called()
+        name = "WebhookNotifier" if backend == "webhook" else "EmailNotifier"
+        assert failed == [name]
+        records = [json.loads(line) for line in stream.getvalue().splitlines()]
+        assert len(records) == 1
+        assert records[0]["event"] == "rpacore.notifier.error"
+        assert records[0]["attributes"] == {"notifier": name, "attempt": 1, "max_attempts": 3}
+
     def test_all_notifiers_called(self):
         n1, n2 = MagicMock(spec=Notifier), MagicMock(spec=Notifier)
         report = _make_report()
@@ -870,7 +1119,8 @@ class TestDispatch:
         assert good.send.call_args.args[0] == report
         assert good.send.call_args.args[0] is not report
 
-    def test_notifier_mutation_cannot_reach_later_views_or_source_report(self):
+    def test_notifier_mutation_cannot_reach_retry_later_views_or_source_report(self, monkeypatch):
+        monkeypatch.setattr("time.sleep", MagicMock())
         report = _make_report()
         report.metadata = {"nested": {"values": ["original"]}}
         report.artifacts[0].metadata = {
@@ -886,13 +1136,21 @@ class TestDispatch:
             )
         ]
         observed: list[TransactionReport] = []
+        attempts: list[TransactionReport] = []
 
         class _MutatingNotifier:
             def send(self, view: TransactionReport) -> None:
+                assert view.metadata == {"nested": {"values": ["original"]}}
+                assert view.artifacts[0].metadata == {"nested": {"values": ["original"]}}
+                assert view.steps[0].exceptions[0].action == "original"
+                assert view.transaction_record["metadata"] == {"customer": "acme"}
+                attempts.append(view)
                 view.metadata["nested"]["values"].append("mutated")
                 view.artifacts[0].metadata["nested"]["values"].append("mutated")
                 view.steps[0].exceptions[0].action = "mutated"
                 view.transaction_record["metadata"]["customer"] = "mutated"
+                if len(attempts) == 1:
+                    raise TimeoutError("retry after mutation")
 
         class _CapturingNotifier:
             def send(self, view: TransactionReport) -> None:
@@ -900,6 +1158,8 @@ class TestDispatch:
 
         dispatch([_MutatingNotifier(), _CapturingNotifier()], report)
 
+        assert len(attempts) == 2
+        assert attempts[0] is not attempts[1]
         assert report.metadata == {"nested": {"values": ["original"]}}
         assert report.artifacts[0].metadata == {
             "nested": {"values": ["original"]}

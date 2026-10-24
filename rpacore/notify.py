@@ -6,7 +6,10 @@ import json
 import logging
 import os
 import smtplib
+import socket
 import ssl
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from email.mime.application import MIMEApplication
@@ -273,13 +276,31 @@ class WebhookNotifier:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=self.timeout) as resp:  # noqa: S310
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
             resp.read()
 
 
 def _redact_url_credentials(parsed: urllib.parse.ParseResult) -> str:
     netloc = parsed.netloc.rsplit("@", 1)[-1]
     return parsed._replace(netloc=f"<credentials>@{netloc}").geturl()
+
+
+def _retryable_notification_error(error: Exception) -> bool:
+    """Recognize temporary transport failures without guessing from messages."""
+    if isinstance(error, urllib.error.HTTPError):
+        return error.code in {408, 429, 500, 502, 503, 504}
+    if isinstance(error, smtplib.SMTPResponseException):
+        return 400 <= error.smtp_code < 500
+    if isinstance(error, smtplib.SMTPRecipientsRefused):
+        return bool(error.recipients) and all(
+            400 <= code < 500 for code, _ in error.recipients.values()
+        )
+    if isinstance(error, smtplib.SMTPServerDisconnected):
+        return True
+    reason = error.reason if isinstance(error, urllib.error.URLError) else error
+    return isinstance(reason, (TimeoutError, ConnectionError)) or (
+        isinstance(reason, socket.gaierror) and reason.errno == socket.EAI_AGAIN
+    )
 
 
 def dispatch(
@@ -291,22 +312,51 @@ def dispatch(
 ) -> None:
     """Send a report through all configured notifiers.
 
-    If a notifier raises, the error is logged and swallowed. When supplied,
-    on_failure receives the failed notifier class name after logging.
+    Temporary transport failures get at most three attempts, with waits of
+    1 then 2 seconds. Every attempt receives an isolated snapshot. Delivery
+    is best-effort: retries may duplicate notifications, and process exit or
+    exhaustion may lose them. Direct notifier.send calls remain single-shot.
+    Terminal failures are logged and swallowed. When supplied, on_failure
+    receives the failed notifier class name once after terminal logging.
     The transaction outcome is never affected by notification failures.
     """
     log = logger if logger is not None else get_logger()
     for notifier in notifiers:
         notifier_name = type(notifier).__name__
+        attempt = 1
         try:
-            notifier.send(_snapshot_report(report))
+            for attempt in range(1, 4):
+                try:
+                    notifier.send(_snapshot_report(report))
+                except MemoryError:
+                    raise
+                except Exception as exc:
+                    if isinstance(exc, urllib.error.HTTPError):
+                        exc.close()
+                    if attempt == 3 or not _retryable_notification_error(exc):
+                        raise
+                    log.warning(
+                        "Notifier %s failed on attempt %s/3; retrying in %s seconds",
+                        notifier_name, attempt, attempt,
+                        extra={
+                            "event": "notifier_retry", "notifier": notifier_name,
+                            "attempt": attempt, "max_attempts": 3,
+                            "wait_seconds": attempt,
+                        },
+                    )
+                    time.sleep(attempt)
+                else:
+                    break
         except MemoryError:
             raise
         except Exception:
             log.exception(
                 "Notifier %s failed; swallowing to protect transaction outcome",
                 notifier_name,
-                extra={"event": "notifier_error", "notifier": notifier_name},
+                extra={
+                    "event": "notifier_error", "notifier": notifier_name,
+                    "attempt": attempt, "max_attempts": 3,
+                },
             )
             if on_failure is not None:
                 try:

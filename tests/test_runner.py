@@ -34,6 +34,7 @@ from rpacore.queue import (
 )
 import rpacore.runner as runner_module
 from rpacore.runner import QueueRunSummary, run_queue_loop
+from rpacore.serialization import serialize_transaction
 from rpacore.step import Step
 from rpacore.status import Status
 from rpacore.transaction import HistoryEvent, Transaction as _Transaction
@@ -801,6 +802,137 @@ class TestAfterItem:
 # ---------------------------------------------------------------------------
 
 class TestRunnerManagedTransactionPersistence:
+    def test_reclaim_during_notification_wait_fences_final_transition(self, tmp_path, monkeypatch):
+        now = datetime(2026, 7, 27, tzinfo=timezone.utc)
+
+        class Clock(_RecordingClock):
+            def now_utc(self):
+                return now
+
+        queue = SqliteQueue({
+            "db_path": str(tmp_path / "queue.db"), "lease_timeout": 30, "max_retries": 1,
+        })
+        queue._clock = Clock()
+        item = _item("notification-lease-loss")
+        queue.add(item)
+        transaction_db = str(tmp_path / "transactions.db")
+        transaction = Transaction(reference=item.reference, steps=[_SuccessStep("step", 1)])
+        replacements = []
+        waits = []
+        sends = []
+        # Keep renewal scheduling out of the deterministic clock advance.
+        monkeypatch.setattr(runner_module, "_lease_renewal_interval", lambda queue: 3600.0)
+
+        def wait(seconds):
+            nonlocal now
+            waits.append(seconds)
+            now += timedelta(seconds=31)
+            replacement = queue.next_item("worker-b")
+            assert replacement is not None
+            replacements.append(replacement)
+
+        monkeypatch.setattr("time.sleep", wait)
+
+        class TransientNotifier:
+            def send(self, report):
+                sends.append(report)
+                if len(sends) == 1:
+                    raise TimeoutError("synthetic notification timeout")
+
+        summary = run_queue_loop(
+            queue=queue,
+            engine=Engine(),
+            build_transaction=lambda item: transaction,
+            config={},
+            credentials=_CREDS,
+            worker_id="worker-a",
+            notifiers=[TransientNotifier()],
+            transaction_db_path=transaction_db,
+        )
+
+        assert waits == [1]
+        assert len(sends) == 2
+        assert summary == QueueRunSummary(processed=1, failed=1, lease_lost=1)
+        stored = queue.get_item(item.id)
+        assert stored is not None
+        assert stored.status is QueueStatus.IN_PROGRESS
+        assert stored.claimed_by == "worker-b"
+        assert stored.claim_token == replacements[0].claim_token
+        assert stored.retry_count == 1
+        assert stored.transaction_id == transaction.id
+        attempts = queue.list_attempts(item.id)
+        assert [attempt.outcome for attempt in attempts] == [QueueAttemptOutcome.LEASE_EXPIRED, None]
+        durable = load_transaction(transaction.id, transaction_db)
+        assert durable.status is durable.steps[0].status is Status.SUCCESSFUL
+        assert durable.retry_count == 0
+
+    @pytest.mark.parametrize("step_cls", [_SuccessStep, _BusinessFailStep])
+    @pytest.mark.parametrize("notification_result", ["recovered", "exhausted", "wait_failed"])
+    def test_notification_retry_preserves_durable_outcome(
+        self, tmp_path, monkeypatch, step_cls, notification_result
+    ) -> None:
+        queue = SqliteQueue({"db_path": str(tmp_path / "queue.db"), "max_retries": 0})
+        item = _item("notification-retry")
+        queue.add(item)
+        transaction_db = str(tmp_path / "transactions.db")
+        transaction = Transaction(reference=item.reference, steps=[step_cls("step", 1)])
+        expected_status = Status.SUCCESSFUL if step_cls is _SuccessStep else Status.FAILED
+        checkpoints = []
+        waits = []
+
+        def wait(seconds):
+            waits.append(seconds)
+            if notification_result == "wait_failed":
+                raise OSError("synthetic wait failure")
+
+        monkeypatch.setattr("time.sleep", wait)
+
+        class TransientNotifier:
+            def send(self, report):
+                checkpoint = load_transaction(transaction.id, transaction_db)
+                assert checkpoint.status is expected_status
+                checkpoints.append(serialize_transaction(checkpoint))
+                report.metadata["notification_mutation"] = True
+                if notification_result != "recovered" or len(checkpoints) < 2:
+                    raise TimeoutError("synthetic notification timeout")
+
+        summary = run_queue_loop(
+            queue=queue,
+            engine=Engine(),
+            build_transaction=lambda item: transaction,
+            config={},
+            credentials=_CREDS,
+            worker_id="retry-proof",
+            notifiers=[TransientNotifier()],
+            transaction_db_path=transaction_db,
+        )
+
+        expected_attempts = {"recovered": 2, "exhausted": 3, "wait_failed": 1}[notification_result]
+        assert len(checkpoints) == expected_attempts
+        assert waits == ([1, 2] if notification_result == "exhausted" else [1])
+        assert summary.processed == 1
+        assert summary.completed == int(step_cls is _SuccessStep)
+        assert summary.failed == int(step_cls is _BusinessFailStep)
+        assert summary.notification_errors == int(notification_result != "recovered")
+        assert summary.persistence_errors == summary.lease_lost == summary.retry_scheduled == 0
+        stored = load_transaction(transaction.id, transaction_db)
+        assert stored.status is expected_status
+        assert stored.steps[0].status is expected_status
+        assert stored.retry_count == 0
+        assert stored.metadata == {}
+        assert all(checkpoint == serialize_transaction(stored) for checkpoint in checkpoints)
+        assert serialize_transaction(transaction) == serialize_transaction(stored)
+        queued = queue.get_item(item.id)
+        assert queued is not None
+        assert queued.transaction_id == transaction.id
+        assert queued.status is (QueueStatus.SUCCESSFUL if step_cls is _SuccessStep else QueueStatus.FAILED)
+        assert queued.retry_count == int(step_cls is _BusinessFailStep)
+        attempts = queue.list_attempts(item.id)
+        assert len(attempts) == 1
+        assert attempts[0].outcome is (
+            QueueAttemptOutcome.SUCCESSFUL if step_cls is _SuccessStep else QueueAttemptOutcome.FAILED
+        )
+
     def test_transaction_database_requires_sqlite_queue(self, tmp_path) -> None:
         with pytest.raises(TypeError, match="transaction_db_path requires SqliteQueue"):
             run_queue_loop(
