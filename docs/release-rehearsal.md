@@ -133,6 +133,14 @@ Then verify:
 - deterministic representative examples pass from the built wheel
 - installed-wheel SQLite probes confirm the required rollback (`delete`) journal
   mode for disposable transaction and queue databases
+- retain the installed-wheel SQLite runtime JSON and available JUnit reports for all
+  Windows/Ubuntu Python 3.11–3.14 cells, matching the candidate wheel SHA-256;
+  missing or failed cells leave runtime safety unverified. The ordinary CI
+  installed-artifact matrix produces these reports through
+  `scripts/validate_installed_wheel.py`; a different wheel requires fresh proof.
+  Precheck failures or interrupted pytest runs may produce no JUnit report;
+  inspect the failed JSON result and job diagnostics. Import or identity failures
+  can also precede JSON publication; absent reports do not establish a pass
 - repository settings match [Repository Settings](repository-settings.md)
 
 Prepare the release manifest and approval draft from the candidate result and

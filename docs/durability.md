@@ -533,6 +533,25 @@ record both Python and SQLite versions so this policy can be revisited from
 runtime evidence. See SQLite's official
 [WAL-reset bug documentation](https://www.sqlite.org/wal.html#walreset).
 
+The installed-wheel gate runs the queue and transaction persistence tests plus
+real-process checkpoint/restart probes outside the source checkout. Its CI
+matrix covers Windows and Ubuntu on Python 3.11–3.14 with one shared wheel.
+Each cell retains `sqlite-runtime.json` and any available JUnit report, joining the wheel
+SHA-256, OS, Python, embedded SQLite version, effective journal modes and test
+result. A configured cell is not proof until its tests pass for that wheel.
+Precheck failures and interrupted pytest runs may leave no JUnit report; use
+the failed JSON result and job diagnostics in those cases. Package-import or
+identity failures may precede JSON publication; absent reports are not passing
+evidence, and reports from a previous attempt are discarded before validation.
+The gate checks supported migration fixtures, future-schema rejection,
+concurrent claims/checkpoints, interruption after a bound checkpoint, stale
+claim rejection and WAL conversion/rejection for shared and separate files.
+
+These probes preserve the existing stdlib/DELETE policy; they do not certify
+every SQLite build or filesystem, power-loss recovery, exactly-once external
+effects, or the initial transaction-save/queue-bind crash interval. No schema
+migration or examples-project update is required to run them.
+
 Rollback journal permits concurrent workers through SQLite's normal locking;
 RPA Core keeps claim, heartbeat, checkpoint, and transition transactions short
 and retains bounded lock retries at the runner boundaries. Do not manually

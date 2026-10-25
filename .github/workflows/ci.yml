@@ -138,7 +138,17 @@ jobs:
         run: python -c "import platform, sqlite3; print(platform.python_version(), sqlite3.sqlite_version)"
 
       - name: Validate installed wheel
-        run: python scripts/validate_installed_wheel.py --repo-root . --wheel-dir dist
+        run: python scripts/validate_installed_wheel.py --repo-root . --wheel-dir dist --work-dir validation-artifacts/installed-wheel
+
+      - name: Retain SQLite runtime safety evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sqlite-runtime-${{ matrix.os }}-py${{ matrix.python-version }}
+          path: |
+            validation-artifacts/installed-wheel/sqlite-runtime/sqlite-runtime.json
+            validation-artifacts/installed-wheel/sqlite-runtime/sqlite-runtime.xml
+          if-no-files-found: warn
 
       - name: Install Windows test dependencies
         if: runner.os == 'Windows' && matrix.python-version == '3.12'

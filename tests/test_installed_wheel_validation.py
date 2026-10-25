@@ -214,7 +214,7 @@ class TestInstalledWheelValidationScript:
                         examples_pytest=[],
                     )
 
-        assert len(calls) == 14
+        assert len(calls) == 15
         assert calls[0][0][1:3] == ["-m", "build"]
         assert calls[1][0][1:3] == ["-m", "venv"]
         assert calls[2][0][1:4] == ["-m", "pip", "install"]
@@ -234,6 +234,13 @@ class TestInstalledWheelValidationScript:
         assert calls[11][0][-2:] == ["transaction", "list"]
         assert calls[12][0][-3:] == ["transaction", "list", "--json"]
         assert calls[13][0][-2:] == ["doctor", "--json"]
+        assert calls[14][0][1:] == [
+            str(repo_root / "scripts" / "validate_sqlite_runtime.py"),
+            "--repo-root", str(repo_root), "--wheel",
+            str(work_dir / "wheelhouse" / "rpacore-0.1.0-py3-none-any.whl"),
+            "--output-dir", str(work_dir / "sqlite-runtime"),
+        ]
+        assert calls[14][1] == work_dir / "outside"
 
     def test_validate_installed_wheel_uses_prebuilt_wheel_dir(self, tmp_path: Path) -> None:
         module = _load_script()
@@ -260,7 +267,7 @@ class TestInstalledWheelValidationScript:
                         examples_pytest=[],
                     )
 
-        assert len(calls) == 13
+        assert len(calls) == 14
         assert all(command[1:3] != ["-m", "build"] for command, _cwd in calls)
         assert calls[0][0][1:3] == ["-m", "venv"]
         assert calls[1][0][1:4] == ["-m", "pip", "install"]
@@ -269,7 +276,8 @@ class TestInstalledWheelValidationScript:
         assert "build>=1.0" in calls[3][0]
         assert "pytest>=8.1.1" in calls[3][0]
         assert calls[4][0][1:4] == ["-m", "mypy", "--no-incremental"]
-        assert calls[-1][0][-2:] == ["doctor", "--json"]
+        assert calls[-2][0][-2:] == ["doctor", "--json"]
+        assert str(wheel) in calls[-1][0]
 
     def test_validate_installed_wheel_removes_existing_generated_project(self, tmp_path: Path) -> None:
         module = _load_script()
@@ -327,7 +335,7 @@ class TestInstalledWheelValidationScript:
                         examples_pytest=["examples/rest_api_batch/tests"],
                     )
 
-        assert len(calls) == 16
+        assert len(calls) == 17
         assert calls[-2][0][-2:] == ["install", "pytest"]
         assert calls[-2][1] == work_dir / "outside"
         assert calls[-1][0][-3:] == ["pytest", "tests", "-q"]
@@ -366,6 +374,10 @@ class TestInstalledWheelValidationScript:
 
     def test_validate_installed_wheel_requires_examples_pytest_with_examples_repo(self, tmp_path: Path) -> None:
         module = _load_script()
+        reports = tmp_path / "work" / "sqlite-runtime"
+        reports.mkdir(parents=True)
+        for name in ("sqlite-runtime.json", "sqlite-runtime.xml"):
+            (reports / name).write_text("stale pass", encoding="utf-8")
 
         try:
             module.validate_installed_wheel(
@@ -377,11 +389,16 @@ class TestInstalledWheelValidationScript:
             )
         except module.ValidationError as exc:
             assert str(exc) == "--examples-pytest is required when --examples-repo is provided"
+            assert list(reports.iterdir()) == []
         else:
             raise AssertionError("Expected ValidationError")
 
     def test_validate_installed_wheel_requires_examples_repo_with_examples_pytest(self, tmp_path: Path) -> None:
         module = _load_script()
+        reports = tmp_path / "work" / "sqlite-runtime"
+        reports.mkdir(parents=True)
+        for name in ("sqlite-runtime.json", "sqlite-runtime.xml"):
+            (reports / name).write_text("stale pass", encoding="utf-8")
 
         try:
             module.validate_installed_wheel(
@@ -393,6 +410,7 @@ class TestInstalledWheelValidationScript:
             )
         except module.ValidationError as exc:
             assert str(exc) == "--examples-repo is required when --examples-pytest is used"
+            assert list(reports.iterdir()) == []
         else:
             raise AssertionError("Expected ValidationError")
 
@@ -401,6 +419,11 @@ class TestInstalledWheelValidationScript:
         repo_root = tmp_path / "repo"
         work_dir = tmp_path / "work"
         repo_root.mkdir()
+        evidence = work_dir / "sqlite-runtime"
+        evidence.mkdir(parents=True)
+        for name in ("sqlite-runtime.json", "sqlite-runtime.xml"):
+            (evidence / name).write_text("stale pass", encoding="utf-8")
+        (evidence / "keep.txt").write_text("caller-owned", encoding="utf-8")
 
         try:
             with patch.object(module, "_run", side_effect=module.ValidationError("boom")):
@@ -418,6 +441,7 @@ class TestInstalledWheelValidationScript:
 
         assert not (work_dir / "wheelhouse").exists()
         assert not (work_dir / "outside").exists()
+        assert sorted(path.name for path in evidence.iterdir()) == ["keep.txt"]
 
     def test_validate_installed_wheel_preserves_keyboard_interrupt_when_cleanup_fails(
         self,

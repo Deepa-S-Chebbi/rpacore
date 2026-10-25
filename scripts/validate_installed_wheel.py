@@ -645,6 +645,9 @@ def validate_installed_wheel(
     outside_dir = work_dir / "outside"
     generated_dirs = (venv_dir, outside_dir) if wheel_dir is not None else (generated_wheelhouse, venv_dir, outside_dir)
 
+    # An attempted invocation must not retain an earlier passing safety report.
+    for name in ("sqlite-runtime.json", "sqlite-runtime.xml"):
+        (work_dir / "sqlite-runtime" / name).unlink(missing_ok=True)
     if examples_repo is not None and not examples_pytest:
         raise ValidationError("--examples-pytest is required when --examples-repo is provided")
     if examples_pytest and examples_repo is None:
@@ -706,6 +709,13 @@ def validate_installed_wheel(
         _run([str(rpacore_cli), "transaction", "list"], cwd=generated_project, allowed_roots=allowed_run_roots)
         _run([str(rpacore_cli), "transaction", "list", "--json"], cwd=generated_project, allowed_roots=allowed_run_roots)
         _run([str(rpacore_cli), "doctor", "--json"], cwd=generated_project, allowed_roots=allowed_run_roots)
+        _run(
+            [str(python), str(repo_root / "scripts" / "validate_sqlite_runtime.py"),
+             "--repo-root", str(repo_root), "--wheel", str(wheel),
+             "--output-dir", str(work_dir / "sqlite-runtime")],
+            cwd=outside_dir,
+            allowed_roots=allowed_run_roots,
+        )
 
         if examples_pytest:
             _run([str(python), "-m", "pip", "install", "pytest"], cwd=outside_dir, allowed_roots=allowed_run_roots)
