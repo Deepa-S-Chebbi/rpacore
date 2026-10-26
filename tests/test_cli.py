@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import closing
 import stat
 import textwrap
 import tomllib
@@ -32,7 +33,6 @@ from rpacore import (
     list_transactions,
     save_transaction,
 )
-from rpacore.persistence import _delete_unbound_pending_transaction
 from tests.cli_helpers import run_cli
 
 
@@ -1244,10 +1244,9 @@ class TestCliTransaction:
             nonlocal cleanup_complete
             if not cleanup_complete:
                 cleanup_complete = True
-                _delete_unbound_pending_transaction(
-                    deleted_during_export.id,
-                    db_path=str(db_path),
-                )
+                with closing(sqlite3.connect(db_path)) as conn, conn:
+                    conn.execute("PRAGMA foreign_keys = ON")
+                    conn.execute("DELETE FROM transactions WHERE id = ?", (deleted_during_export.id,))
             return serialize_transaction(transaction)
 
         monkeypatch.setattr(

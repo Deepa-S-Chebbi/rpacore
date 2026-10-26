@@ -10,11 +10,13 @@ from pathlib import Path
 
 import pytest
 
+from rpacore._queue_checkpoint import _save_queue_transaction_fenced
+
 from rpacore import (
     QueueItem, QueueStatus, SqliteQueue, Status, Transaction, TransactionFenceError,
     load_transaction, save_transaction,
 )
-from rpacore.persistence import _prepare_transaction_database, _save_queue_transaction_fenced
+from rpacore.persistence import _prepare_transaction_database
 
 
 _WORKER = """
@@ -49,12 +51,63 @@ assert summary.completed == 1 and summary.failed == 0, summary
 """
 
 
+_INITIAL_PAUSE = """
+import sqlite3, sys, time
+from pathlib import Path
+import rpacore.persistence as persistence
+import rpacore.runner as runner
+
+phase = sys.argv.pop()
+active_transaction = None
+def pause(transaction):
+    Path(sys.argv[3]).write_text(transaction.id, encoding='utf-8')
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        time.sleep(.02)
+    raise TimeoutError('parent did not kill worker')
+
+write = persistence._write_transaction_rows
+def paused_write(connection, transaction, **kwargs):
+    global active_transaction
+    active_transaction = transaction
+    if phase == 'before-rows':
+        pause(transaction)
+    revision = write(connection, transaction, **kwargs)
+    if phase == 'after-rows':
+        pause(transaction)
+    return revision
+persistence._write_transaction_rows = paused_write
+save = runner._save_queue_transaction_fenced
+def paused_save(transaction, **kwargs):
+    revision = save(transaction, **kwargs)
+    if phase == 'after-commit':
+        pause(transaction)
+    return revision
+runner._save_queue_transaction_fenced = paused_save
+connect = sqlite3.connect
+class PausedConnection(sqlite3.Connection):
+    def execute(self, sql, *args, **kwargs):
+        if phase == 'before-commit' and sql == 'COMMIT' and active_transaction is not None:
+            schema = 'queue_guard' if any(row[1] == 'queue_guard' for row in
+                super().execute('PRAGMA database_list')) else 'main'
+            binding = super().execute(f'SELECT transaction_id FROM {schema}.queue_items').fetchone()[0]
+            assert binding == active_transaction.id
+            pause(active_transaction)
+        return super().execute(sql, *args, **kwargs)
+def paused_connect(*args, **kwargs):
+    return connect(*args, factory=PausedConnection, **kwargs)
+sqlite3.connect = paused_connect
+"""
+
+
 @contextmanager
-def _worker(queue_path, transaction_path, ready, release):
+def _worker(queue_path, transaction_path, ready, release, *, phase=None):
     env = os.environ.copy()
     env.pop("PYTHONPATH", None)
     process = subprocess.Popen(
-        [sys.executable, "-c", _WORKER, str(queue_path), str(transaction_path), str(ready), str(release)],
+        [sys.executable, "-c", (_INITIAL_PAUSE if phase else "") + _WORKER,
+         str(queue_path), str(transaction_path), str(ready), str(release),
+         *([phase] if phase else [])],
         env=env,
     )
     try:
@@ -89,6 +142,47 @@ def _assert_storage(queue, transaction_path, count):
             assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
             assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
             assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+@pytest.mark.parametrize("shared", [False, True], ids=["separate-files", "shared-file"])
+@pytest.mark.parametrize("phase", ["before-rows", "after-rows", "before-commit", "after-commit"])
+def test_initial_transaction_and_binding_survive_or_roll_back_together(tmp_path, shared, phase):
+    queue_path = tmp_path / "queue.db"
+    transaction_path = queue_path if shared else tmp_path / "transactions.db"
+    queue = SqliteQueue({"db_path": str(queue_path), "lease_timeout": 60})
+    queue.add(QueueItem(reference="initial-crash", payload={}))
+    ready, release = tmp_path / "ready", tmp_path / "release"
+    with _worker(queue_path, transaction_path, ready, release, phase=phase) as interrupted:
+        _wait_ready(interrupted, ready)
+        interrupted_id = ready.read_text(encoding="utf-8")
+        interrupted.kill()
+        assert interrupted.wait(timeout=10) != 0
+    stale = queue.list_items()[0]
+    committed = phase == "after-commit"
+    assert stale.transaction_id == (interrupted_id if committed else "")
+    with closing(sqlite3.connect(transaction_path)) as connection:
+        rows = connection.execute("SELECT id, revision, status, state FROM transactions").fetchall()
+        assert rows == ([(interrupted_id, 1, "pending", "{}")] if committed else [])
+        assert connection.execute("SELECT COUNT(*) FROM steps").fetchone()[0] == (2 if committed else 0)
+        for table in ("transaction_history", "exceptions", "transaction_metadata", "transaction_artifacts"):
+            assert connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+    assert not release.exists()
+    # Reclaim must resume the committed ID; a rolled-back initialization may create one.
+    with closing(sqlite3.connect(queue_path)) as connection, connection:
+        connection.execute("UPDATE queue_items SET claimed_at = '2000-01-01T00:00:00+00:00'")
+    with _worker(queue_path, transaction_path, tmp_path / "resumed", release) as successor:
+        _wait_ready(successor, tmp_path / "resumed")
+        current = queue.list_items()[0]
+        assert current.claim_token != stale.claim_token
+        assert (current.transaction_id == interrupted_id) is committed
+        release.touch()
+        assert successor.wait(timeout=20) == 0
+    _assert_storage(queue, transaction_path, 1)
+    with closing(sqlite3.connect(transaction_path)) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 1
+    attempts = queue.list_attempts(stale.id)
+    assert len(attempts) == 2
+    assert attempts[0].claim_token != attempts[1].claim_token
 
 
 @pytest.mark.parametrize("shared", [False, True], ids=["separate-files", "shared-file"])

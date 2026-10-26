@@ -2,10 +2,15 @@
 
 import json
 import sqlite3
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+
+from rpacore._json_state import JsonStateError
+from rpacore._queue_checkpoint import _save_queue_transaction_fenced
+from rpacore.persistence import _prepare_transaction_database
 
 import rpacore.persistence as persistence_module
 from rpacore.context import ProcessContext
@@ -20,8 +25,6 @@ from rpacore.outcome import OutcomeCategory, RetryDisposition
 from rpacore.persistence import (
     TransactionFenceError,
     TransactionPage,
-    _delete_unbound_pending_transaction,
-    _save_queue_transaction_fenced,
     iter_transactions,
     list_transactions,
     load_transaction,
@@ -1199,10 +1202,9 @@ class TestSaveAndLoad:
             readonly: bool = False,
         ) -> Transaction:
             if transaction_id == deleted_during_list.id:
-                _delete_unbound_pending_transaction(
-                    transaction_id,
-                    db_path=database_path,
-                )
+                with closing(sqlite3.connect(database_path)) as conn, conn:
+                    conn.execute("PRAGMA foreign_keys = ON")
+                    conn.execute("DELETE FROM transactions WHERE id = ?", (transaction_id,))
             return load_transaction(
                 transaction_id,
                 database_path,
@@ -1328,10 +1330,9 @@ class TestSaveAndLoad:
         transactions = iter_transactions(db_path, readonly=True)
 
         assert next(transactions).id == first.id
-        _delete_unbound_pending_transaction(
-            deleted_during_iteration.id,
-            db_path=db_path,
-        )
+        with closing(sqlite3.connect(db_path)) as conn, conn:
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("DELETE FROM transactions WHERE id = ?", (deleted_during_iteration.id,))
 
         assert list(transactions) == []
 
@@ -1354,10 +1355,9 @@ class TestSaveAndLoad:
             *,
             readonly: bool = False,
         ) -> Transaction:
-            _delete_unbound_pending_transaction(
-                transaction_id,
-                db_path=database_path,
-            )
+            with closing(sqlite3.connect(database_path)) as conn, conn:
+                conn.execute("PRAGMA foreign_keys = ON")
+                conn.execute("DELETE FROM transactions WHERE id = ?", (transaction_id,))
             return load_transaction(
                 transaction_id,
                 database_path,
@@ -1427,6 +1427,194 @@ class TestSaveAndLoad:
 
 
 class TestQueueClaimFencing:
+    @pytest.mark.parametrize("shared", [False, True])
+    def test_initial_future_queue_schema_changes_neither_database(self, tmp_path, shared):
+        from rpacore._sqlite import QUEUE_SCHEMA_VERSION
+        from rpacore.queue import QueueItem, SqliteQueue
+
+        queue_path = tmp_path / "queue.db"
+        transaction_path = queue_path if shared else tmp_path / "transactions.db"
+        queue = SqliteQueue({"db_path": str(queue_path)})
+        queue.add(QueueItem(reference="future-schema", payload={}))
+        claim = queue.next_item("worker")
+        existing = make_transaction(
+            state={"keep": True}, metadata={"keep": True},
+            artifacts=[Artifact(name="keep", path="keep")], steps=[Step("keep", 1)],
+        )
+        existing.steps[0].exceptions.append(BusinessException("keep", action="keep"))
+        existing.append_history(HistoryEvent.STEP_FAILED, step=existing.steps[0])
+        save_transaction(existing, str(transaction_path))
+        candidate = make_transaction(steps=[Step("new", 1)])
+        with closing(sqlite3.connect(queue_path)) as conn, conn:
+            conn.execute("UPDATE rpacore_schema_versions SET version = ? WHERE component = 'queue'",
+                         (QUEUE_SCHEMA_VERSION + 1,))
+        paths = {queue_path, transaction_path}
+        before = {path: path.read_bytes() for path in paths}
+        with pytest.raises(RuntimeError, match=f"Unsupported queue schema version {QUEUE_SCHEMA_VERSION + 1}"):
+            _save_queue_transaction_fenced(
+                candidate, db_path=str(transaction_path), queue_db_path=str(queue_path),
+                queue_item_id=claim.id, claimed_by=claim.claimed_by, claim_token=claim.claim_token,
+                expected_revision=0, initial=True,
+            )
+        assert {path: path.read_bytes() for path in paths} == before
+        assert transaction_storage_snapshot(str(transaction_path), candidate.id)["transactions"] == []
+
+    @pytest.mark.parametrize("shared", [False, True])
+    @pytest.mark.parametrize("transaction_id", ["", " \t", None, 123, False])
+    def test_initial_invalid_id_cannot_publish_an_unbound_snapshot(self, tmp_path, shared, transaction_id):
+        from rpacore.queue import QueueItem, SqliteQueue
+
+        queue_db = str(tmp_path / "queue.db")
+        transaction_db = queue_db if shared else str(tmp_path / "transactions.db")
+        queue = SqliteQueue({"db_path": queue_db})
+        queue.add(QueueItem(reference="invalid-id", payload={}))
+        claim = queue.next_item("worker")
+        _prepare_transaction_database(transaction_db)
+        before = queue.get_item(claim.id)
+        transaction = make_transaction(id=transaction_id, steps=[Step("step", 1)])
+        with pytest.raises(ExecutionValidationError, match="transaction.id must be a nonblank str"):
+            _save_queue_transaction_fenced(
+                transaction, db_path=transaction_db, queue_db_path=queue_db,
+                queue_item_id=claim.id, claimed_by=claim.claimed_by, claim_token=claim.claim_token,
+                expected_revision=0, initial=True,
+            )
+        assert queue.get_item(claim.id) == before
+        with closing(sqlite3.connect(transaction_db)) as conn:
+            for table in ("transactions", "steps", "exceptions", "transaction_history",
+                          "transaction_metadata", "transaction_artifacts"):
+                assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+
+    @pytest.mark.parametrize("shared", [False, True])
+    @pytest.mark.parametrize("bound", [False, True])
+    def test_initial_snapshot_and_empty_or_matching_binding_commit_together(self, tmp_path, shared, bound):
+        from rpacore.queue import QueueItem, SqliteQueue
+
+        queue_db = str(tmp_path / "queue.db")
+        transaction_db = queue_db if shared else str(tmp_path / "transactions.db")
+        queue = SqliteQueue({"db_path": queue_db})
+        queue.add(QueueItem(reference="initial", payload={}))
+        claim = queue.next_item("worker")
+        transaction = make_transaction(steps=[Step("step", 1)], metadata={"source": "initial"},
+                                       artifacts=[Artifact(name="file", path="file.txt")])
+        if bound:
+            queue.bind_transaction(claim.id, transaction.id,
+                                   claimed_by=claim.claimed_by, claim_token=claim.claim_token)
+        revision = _save_queue_transaction_fenced(
+            transaction, db_path=transaction_db, queue_db_path=queue_db,
+            queue_item_id=claim.id, claimed_by=claim.claimed_by, claim_token=claim.claim_token,
+            expected_revision=0, initial=True,
+        )
+        assert revision == 1
+        assert queue.get_item(claim.id).transaction_id == transaction.id
+        loaded = load_transaction(transaction.id, transaction_db, readonly=True)
+        assert loaded.status is Status.PENDING and loaded.history == []
+        assert loaded.metadata == transaction.metadata
+        assert loaded.artifacts == transaction.artifacts
+        assert len(loaded.steps) == 1
+
+    @pytest.mark.parametrize("shared", [False, True])
+    @pytest.mark.parametrize("existing", ["current", "matching-zero", "migrated-zero"])
+    def test_initial_creation_rejects_every_existing_id_without_changes(self, tmp_path, shared, existing):
+        from rpacore.queue import QueueItem, SqliteQueue
+
+        queue_db = str(tmp_path / "queue.db")
+        transaction_db = queue_db if shared else str(tmp_path / "transactions.db")
+        if existing == "migrated-zero":
+            transaction_id = create_versioned_db(transaction_db, 5)
+            _prepare_transaction_database(transaction_db)
+        else:
+            transaction = make_transaction(state={"retained": True}, steps=[Step("old", 1)],
+                                           metadata={"old": True}, artifacts=[Artifact(name="old", path="old")])
+            save_transaction(transaction, transaction_db)
+            transaction_id = transaction.id
+            if existing == "matching-zero":
+                with closing(sqlite3.connect(transaction_db)) as conn, conn:
+                    conn.execute("UPDATE transactions SET revision = 0 WHERE id = ?", (transaction_id,))
+        queue = SqliteQueue({"db_path": queue_db})
+        queue.add(QueueItem(reference="collision", payload={}))
+        claim = queue.next_item("worker")
+        before = transaction_storage_snapshot(transaction_db, transaction_id)
+        binding_before = queue.get_item(claim.id)
+        candidate = make_transaction(id=transaction_id, state={"overwrite": True}, steps=[Step("new", 1)])
+        with pytest.raises(ExecutionValidationError, match="already exists"):
+            _save_queue_transaction_fenced(
+                candidate, db_path=transaction_db, queue_db_path=queue_db,
+                queue_item_id=claim.id, claimed_by=claim.claimed_by, claim_token=claim.claim_token,
+                expected_revision=0, initial=True,
+            )
+        assert transaction_storage_snapshot(transaction_db, transaction_id) == before
+        assert queue.get_item(claim.id) == binding_before
+
+    @pytest.mark.parametrize("shared", [False, True])
+    @pytest.mark.parametrize("failure", ["stale", "binding", "credential", "invalid", "after-rows", "commit", "bind-abort", "bind-ignore"])
+    def test_initial_failure_preserves_queue_and_all_snapshot_rows(self, monkeypatch, tmp_path, shared, failure):
+        from rpacore.queue import QueueItem, SqliteQueue
+
+        queue_db = str(tmp_path / "queue.db")
+        transaction_db = queue_db if shared else str(tmp_path / "transactions.db")
+        queue = SqliteQueue({"db_path": queue_db, "lease_timeout": 1})
+        queue.add(QueueItem(reference="failure", payload={}))
+        claim = queue.next_item("same-label")
+        _prepare_transaction_database(transaction_db)
+        transaction = make_transaction(state={"new": True}, steps=[Step("new", 1)],
+                                       metadata={"new": True}, artifacts=[Artifact(name="new", path="new")])
+        error = TransactionFenceError
+        if failure == "stale":
+            with closing(sqlite3.connect(queue_db)) as conn, conn:
+                conn.execute("UPDATE queue_items SET claimed_at = '2000-01-01T00:00:00+00:00'")
+            replacement = queue.next_item("same-label")
+            assert replacement.claim_token != claim.claim_token
+        elif failure == "binding":
+            queue.bind_transaction(claim.id, "other", claimed_by=claim.claimed_by, claim_token=claim.claim_token)
+        elif failure == "credential":
+            claim.claim_token = ""
+        elif failure == "invalid":
+            transaction.state["bad"] = object()
+            error = JsonStateError
+        elif failure == "after-rows":
+            real_write = persistence_module._write_transaction_rows
+            def write_then_fail(*args, **kwargs):
+                real_write(*args, **kwargs)
+                raise sqlite3.IntegrityError("injected write failure")
+            monkeypatch.setattr(persistence_module, "_write_transaction_rows", write_then_fail)
+            error = sqlite3.IntegrityError
+        elif failure == "commit":
+            connect = sqlite3.connect
+            class FailingCommitConnection(sqlite3.Connection):
+                def execute(self, sql, *args, **kwargs):
+                    if sql == "COMMIT":
+                        # Prove both writes and all snapshot children exist in
+                        # the uncommitted transaction before raising.
+                        assert super().execute("SELECT COUNT(*) FROM steps").fetchone()[0] == 1
+                        assert super().execute("SELECT COUNT(*) FROM transaction_metadata").fetchone()[0] == 1
+                        assert super().execute("SELECT COUNT(*) FROM transaction_artifacts").fetchone()[0] == 1
+                        schema = "main" if shared else "queue_guard"
+                        assert super().execute(
+                            f"SELECT transaction_id FROM {schema}.queue_items WHERE id = ?", (claim.id,),
+                        ).fetchone()[0] == transaction.id
+                        raise sqlite3.OperationalError("injected commit failure")
+                    return super().execute(sql, *args, **kwargs)
+            monkeypatch.setattr(sqlite3, "connect", lambda *args, **kwargs: connect(
+                *args, factory=FailingCommitConnection, **kwargs))
+            error = sqlite3.OperationalError
+        elif failure.startswith("bind-"):
+            action = "ABORT, 'injected bind failure'" if failure == "bind-abort" else "IGNORE"
+            with closing(sqlite3.connect(queue_db)) as conn, conn:
+                conn.execute(f"CREATE TRIGGER reject_binding BEFORE UPDATE OF transaction_id ON queue_items "
+                             f"BEGIN SELECT RAISE({action}); END")
+            error = sqlite3.IntegrityError if failure == "bind-abort" else TransactionFenceError
+        before = transaction_storage_snapshot(transaction_db, transaction.id)
+        binding_before = queue.get_item(claim.id)
+        match = {"credential": "no claim credential", "commit": "injected commit failure"}.get(failure)
+        with pytest.raises(error, match=match):
+            _save_queue_transaction_fenced(
+                transaction, db_path=transaction_db, queue_db_path=queue_db,
+                queue_item_id=claim.id, claimed_by=claim.claimed_by, claim_token=claim.claim_token,
+                expected_revision=0, initial=True,
+            )
+        assert transaction_storage_snapshot(transaction_db, transaction.id) == before
+        assert queue.get_item(claim.id) == binding_before
+
     def test_stale_same_label_checkpoint_changes_no_transaction_rows(self, tmp_path) -> None:
         from rpacore.queue import QueueItem, SqliteQueue
 
@@ -2728,25 +2916,6 @@ class TestSchemaMigration:
 
         with open(db_path, "rb") as database_file:
             assert database_file.read() == before
-
-    def test_delete_unbound_pending_transaction_is_persistence_owned(self, db_path) -> None:
-        transaction = make_transaction()
-        save_transaction(transaction, db_path)
-
-        _delete_unbound_pending_transaction(transaction.id, db_path=db_path)
-
-        with pytest.raises(KeyError, match="Transaction not found"):
-            load_transaction(transaction.id, db_path)
-
-    def test_delete_unbound_pending_transaction_rejects_started_work(self, db_path) -> None:
-        transaction = make_transaction(status=Status.IN_PROGRESS)
-        transaction.append_history(HistoryEvent.TRANSACTION_STARTED)
-        save_transaction(transaction, db_path)
-
-        with pytest.raises(RuntimeError, match="Refusing to delete transaction"):
-            _delete_unbound_pending_transaction(transaction.id, db_path=db_path)
-
-        assert load_transaction(transaction.id, db_path).status is Status.IN_PROGRESS
 
     def test_unrelated_schema_errors_are_not_swallowed(self, db_path) -> None:
         conn = sqlite3.connect(db_path)

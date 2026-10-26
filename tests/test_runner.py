@@ -403,7 +403,7 @@ class TestQueueRunSummary:
             transaction_db_path=db_path,
         )
         retry_item = _item("a")
-        retry_item.transaction_id = first_queue.bindings[0][1]
+        retry_item.transaction_id = first_queue.get_item(first.id).transaction_id
 
         second_summary, second_queue = _run(
             [retry_item],
@@ -1532,54 +1532,44 @@ class TestRunnerManagedTransactionPersistence:
         assert "stale-write" not in durable.state
         assert durable.steps[0].status is Status.IN_PROGRESS
 
-    def test_initial_transaction_is_persisted_and_bound_before_step_execution(self, tmp_path) -> None:
+    def test_initial_transaction_is_persisted_and_bound_before_step_execution(self, monkeypatch, tmp_path) -> None:
         db_path = str(tmp_path / "transactions.db")
         events: list[str] = []
 
         class BindingQueue(_RecordingSqliteQueue):
-            def bind_transaction(
-                self,
-                item_id: str,
-                transaction_id: str,
-                *,
-                claimed_by: str,
-                claim_token: str,
-            ) -> None:
-                loaded = load_transaction(transaction_id, db_path)
-                assert loaded.status is Status.PENDING
-                assert loaded.history == []
-                events.append("bind")
-                super().bind_transaction(
-                    item_id,
-                    transaction_id,
-                    claimed_by=claimed_by,
-                    claim_token=claim_token,
-                )
-
-        class RecordingStep(Step):
-            def execute(self, ctx: ProcessContext) -> None:
-                events.append("execute")
+            def bind_transaction(self, *args, **kwargs) -> None:
+                raise AssertionError("persisted initialization must bypass binding overrides")
 
         item = _item("ordered")
         queue = BindingQueue([item], str(tmp_path / "queue.db"))
+        real_save = runner_module._save_queue_transaction_fenced
 
-        run_queue_loop(
-            queue=queue,
-            engine=Engine(),
+        def observe_initial(transaction, **kwargs):
+            revision = real_save(transaction, **kwargs)
+            if kwargs.get("initial"):
+                loaded = load_transaction(transaction.id, db_path, readonly=True)
+                assert loaded.status is Status.PENDING
+                assert loaded.history == []
+                assert queue.get_item(item.id).transaction_id == transaction.id
+                events.append("bound")
+            return revision
+
+        monkeypatch.setattr(runner_module, "_save_queue_transaction_fenced", observe_initial)
+
+        class RecordingStep(Step):
+            def execute(self, ctx: ProcessContext) -> None:
+                assert queue.get_item(item.id).transaction_id == ctx.transaction.id
+                events.append("execute")
+
+        summary = run_queue_loop(
+            queue=queue, engine=Engine(),
             build_transaction=lambda queue_item: Transaction(
-                reference=queue_item.reference,
-                steps=[RecordingStep("record", 1)],
-            ),
-            config={},
-            credentials=_CREDS,
-            worker_id="test-worker",
-            transaction_db_path=db_path,
+                reference=queue_item.reference, steps=[RecordingStep("record", 1)]),
+            config={}, credentials=_CREDS, worker_id="test-worker", transaction_db_path=db_path,
         )
-
-        assert events == ["bind", "execute"]
-        stored = queue.get_item(item.id)
-        assert stored is not None
-        assert queue.bindings[0][1] == stored.transaction_id
+        assert summary.completed == 1
+        assert events == ["bound", "execute"]
+        assert queue.bindings == []
 
     def test_initial_persistence_and_binding_share_one_operation_lock(self, tmp_path) -> None:
         class CountingLock:
@@ -1616,52 +1606,32 @@ class TestRunnerManagedTransactionPersistence:
         assert transaction.id == item.transaction_id
         assert revision == 1
 
-    def test_initial_bind_failure_cleanup_shares_operation_lock(self, tmp_path) -> None:
-        class CountingLock:
-            def __init__(self) -> None:
-                self.acquisitions = 0
+    def test_initial_write_failure_rolls_back_under_operation_lock(self, monkeypatch, tmp_path) -> None:
+        import rpacore.persistence as persistence
+        lock = threading.RLock()
+        real_write = persistence._write_transaction_rows
 
-            def __enter__(self) -> None:
-                self.acquisitions += 1
+        def write_then_fail(*args, **kwargs):
+            assert lock._is_owned()
+            real_write(*args, **kwargs)
+            raise RuntimeError("write failed")
 
-            def __exit__(self, exc_type, exc_value, traceback) -> None:
-                pass
-
-        class FailingBindQueue(_RecordingSqliteQueue):
-            def bind_transaction(
-                self,
-                item_id: str,
-                transaction_id: str,
-                *,
-                claimed_by: str,
-                claim_token: str,
-            ) -> None:
-                raise RuntimeError("lost claim")
-
+        monkeypatch.setattr(persistence, "_write_transaction_rows", write_then_fail)
         transaction_db = str(tmp_path / "transactions.db")
-        queue = FailingBindQueue(
-            [_item("initial-cleanup-operation-lock")],
-            str(tmp_path / "queue.db"),
-        )
+        queue = _RecordingSqliteQueue([_item("write-failure")], str(tmp_path / "queue.db"))
         item = queue.next_item("test-worker")
-        assert item is not None
-        operation_lock = CountingLock()
-
-        with pytest.raises(runner_module._DurableTransactionBindingError, match="lost claim"):
+        summary = QueueRunSummary()
+        with pytest.raises(runner_module._CheckpointError, match="write failed"):
             runner_module._transaction_for_queue_item(
-                queue,
-                item,
-                lambda queue_item: Transaction(reference=queue_item.reference),
-                transaction_db_path=transaction_db,
-                retry_business_failures=False,
-                worker_id="test-worker",
-                log=logging.getLogger("test.runner.initial-cleanup-operation-lock"),
-                summary=QueueRunSummary(),
-                operation_lock=operation_lock,
+                queue, item, lambda item: Transaction(reference=item.reference),
+                transaction_db_path=transaction_db, retry_business_failures=False,
+                worker_id="test-worker", log=logging.getLogger(__name__),
+                summary=summary, operation_lock=lock,
             )
-
-        assert operation_lock.acquisitions == 1
-        assert list_transactions(transaction_db) == []
+        assert summary.persistence_errors == 1
+        assert item.transaction_id == ""
+        assert queue.get_item(item.id).transaction_id == ""
+        assert list_transactions(transaction_db, readonly=True) == []
 
     @pytest.mark.parametrize(
         ("case", "expected_error"),
@@ -1744,197 +1714,95 @@ class TestRunnerManagedTransactionPersistence:
         assert after_items[0][0] is None
         assert expected_error in str(after_items[0][1])
 
-    def test_bind_failure_removes_initial_transaction_and_fails_without_retry(self, tmp_path) -> None:
-        db_path = str(tmp_path / "transactions.db")
-        errors: list[Exception | None] = []
-
-        class FailingBindQueue(_RecordingSqliteQueue):
-            def bind_transaction(
-                self,
-                item_id: str,
-                transaction_id: str,
-                *,
-                claimed_by: str,
-                claim_token: str,
-            ) -> None:
-                raise RuntimeError("lost claim")
-
-        queue = FailingBindQueue(
-            [_item("bind-fail")],
-            str(tmp_path / "queue.db"),
-        )
-
-        summary = run_queue_loop(
-            queue=queue,
-            engine=Engine(),
-            build_transaction=lambda item: Transaction(
-                reference=item.reference,
-                steps=[_SuccessStep("step", 1)],
-            ),
-            config={},
-            credentials=_CREDS,
-            worker_id="test-worker",
-            transaction_db_path=db_path,
-            after_item=lambda item, tx, err: errors.append(err),
-        )
-
-        assert summary.failed == 1
-        assert summary.completed == 0
-        assert summary.persistence_errors == 0
-        assert queue.failed == ["bind-fail"]
-        assert queue.fail_retries == [False]
-        assert list_transactions(db_path) == []
-        assert errors
-        assert "could not bind transaction" in str(errors[0])
-
-    def test_bind_lease_loss_cleans_up_and_stops_without_transition(self, tmp_path) -> None:
+    def test_initial_lease_loss_stops_without_write_or_transition(self, tmp_path) -> None:
         transaction_db = str(tmp_path / "transactions.db")
-        replacement_tokens: list[str] = []
-        after_items: list[tuple[Transaction | None, Exception | None]] = []
+        queue = _RecordingSqliteQueue([_item("initial-lease-loss")], str(tmp_path / "queue.db"), max_retries=1)
+        replacement_tokens = []
 
-        class ReclaimBeforeBindQueue(_RecordingSqliteQueue):
-            def bind_transaction(
-                self,
-                item_id: str,
-                transaction_id: str,
-                *,
-                claimed_by: str,
-                claim_token: str,
-            ) -> None:
-                conn = sqlite3.connect(self.db_path)
-                try:
-                    conn.execute(
-                        "UPDATE queue_items SET claimed_at = '2000-01-01T00:00:00+00:00' "
-                        "WHERE id = ?",
-                        (item_id,),
-                    )
-                    conn.commit()
-                finally:
-                    conn.close()
-                replacement = self.next_item("replacement-worker")
-                assert replacement is not None
-                replacement_tokens.append(replacement.claim_token)
-                super().bind_transaction(
-                    item_id,
-                    transaction_id,
-                    claimed_by=claimed_by,
-                    claim_token=claim_token,
-                )
-
-        item = _item("bind-lease-loss")
-        queue = ReclaimBeforeBindQueue(
-            [item],
-            str(tmp_path / "queue.db"),
-            max_retries=1,
-        )
+        def build(item):
+            conn = sqlite3.connect(queue.db_path)
+            with conn:
+                conn.execute("UPDATE queue_items SET claimed_at = '2000-01-01T00:00:00+00:00'")
+            conn.close()
+            replacement = queue.next_item("test-worker")
+            replacement_tokens.append(replacement.claim_token)
+            return Transaction(reference=item.reference, steps=[_SuccessStep("step", 1)])
 
         summary = run_queue_loop(
-            queue=queue,
-            engine=Engine(),
-            build_transaction=lambda queue_item: Transaction(
-                reference=queue_item.reference,
-                steps=[_SuccessStep("step", 1)],
-            ),
-            config={},
-            credentials=_CREDS,
-            worker_id="test-worker",
+            queue, Engine(), build, {}, _CREDS, worker_id="test-worker",
             transaction_db_path=transaction_db,
-            after_item=lambda _item, transaction, error: after_items.append(
-                (transaction, error)
-            ),
+            after_item=lambda *args: pytest.fail("stale worker must skip callbacks"),
         )
-
-        stored = queue.get_item(item.id)
-        assert stored is not None
-        assert after_items == []
+        stored = queue.get_item("initial-lease-loss")
         assert summary == QueueRunSummary(processed=1, failed=1, lease_lost=1)
         assert stored.status is QueueStatus.IN_PROGRESS
-        assert stored.claimed_by == "replacement-worker"
         assert stored.claim_token == replacement_tokens[0]
         assert stored.transaction_id == ""
-        assert list_transactions(transaction_db) == []
-
-    def test_bind_memory_error_propagates_after_initial_transaction_cleanup(self, tmp_path) -> None:
-        db_path = str(tmp_path / "transactions.db")
-
-        class MemoryErrorBindQueue(_RecordingSqliteQueue):
-            def bind_transaction(
-                self,
-                item_id: str,
-                transaction_id: str,
-                *,
-                claimed_by: str,
-                claim_token: str,
-            ) -> None:
-                raise MemoryError("binding exhausted memory")
-
-        queue = MemoryErrorBindQueue(
-            [_item("bind-fatal")],
-            str(tmp_path / "queue.db"),
-        )
-
-        with pytest.raises(MemoryError, match="binding exhausted memory"):
-            run_queue_loop(
-                queue=queue,
-                engine=Engine(),
-                build_transaction=lambda item: Transaction(
-                    reference=item.reference,
-                    steps=[_SuccessStep("step", 1)],
-                ),
-                config={},
-                credentials=_CREDS,
-                worker_id="test-worker",
-                transaction_db_path=db_path,
-            )
-
-        assert queue.completed == []
         assert queue.failed == []
-        assert list_transactions(db_path) == []
+        assert list_transactions(transaction_db, readonly=True) == []
 
-    def test_bind_fatal_cleanup_failure_is_not_replaced(self, monkeypatch, tmp_path) -> None:
+    @pytest.mark.parametrize("signal", [MemoryError, KeyboardInterrupt, SystemExit])
+    def test_initial_fatal_write_rolls_back_and_joins_heartbeat(self, monkeypatch, tmp_path, signal) -> None:
+        import rpacore.persistence as persistence
+        real_write = persistence._write_transaction_rows
+        heartbeats = []
+        real_start = runner_module._start_lease_heartbeat
+
+        def observe_start(*args, **kwargs):
+            heartbeat = real_start(*args, **kwargs)
+            heartbeats.append(heartbeat)
+            return heartbeat
+
+        def write_then_fail(*args, **kwargs):
+            real_write(*args, **kwargs)
+            raise signal("initial write fatal")
+
+        monkeypatch.setattr(persistence, "_write_transaction_rows", write_then_fail)
+        monkeypatch.setattr(runner_module, "_start_lease_heartbeat", observe_start)
+        queue = _RecordingSqliteQueue([_item("fatal")], str(tmp_path / "queue.db"))
         db_path = str(tmp_path / "transactions.db")
+        with pytest.raises(signal, match="initial write fatal"):
+            run_queue_loop(queue, Engine(), lambda item: Transaction(item.reference), {}, _CREDS,
+                           worker_id="test-worker", transaction_db_path=db_path)
+        assert queue.completed == queue.failed == []
+        assert queue.get_item("fatal").transaction_id == ""
+        assert list_transactions(db_path, readonly=True) == []
+        assert len(heartbeats) == 1
+        assert not heartbeats[0].thread.is_alive()
 
-        class MemoryErrorBindQueue(_RecordingSqliteQueue):
-            def bind_transaction(
-                self,
-                item_id: str,
-                transaction_id: str,
-                *,
-                claimed_by: str,
-                claim_token: str,
-            ) -> None:
-                raise MemoryError("binding exhausted memory")
-
-        def _fail_delete(transaction_id: str, *, db_path: str) -> None:
-            raise RuntimeError("initial transaction cleanup failed")
-
-        monkeypatch.setattr(
-            runner_module,
-            "_delete_unbound_pending_transaction",
-            _fail_delete,
+    @pytest.mark.parametrize("invalid_id", ["duplicate", "blank"])
+    def test_initial_id_validation_reaches_callback_without_retry_or_mutation(self, tmp_path, invalid_id) -> None:
+        db_path = str(tmp_path / "transactions.db")
+        existing = Transaction("existing", state={"retained": True}, metadata={"retained": True},
+                               steps=[_SuccessStep("retained", 1)])
+        save_transaction(existing, db_path)
+        before = Path(db_path).read_bytes()
+        queue = _RecordingSqliteQueue([_item("invalid-id")], str(tmp_path / "queue.db"), max_retries=3)
+        callbacks = []
+        executed = []
+        class RecordingStep(Step):
+            def execute(self, ctx):
+                executed.append(True)
+        transaction_id = existing.id if invalid_id == "duplicate" else ""
+        summary = run_queue_loop(
+            queue, Engine(), lambda item: Transaction(item.reference, id=transaction_id,
+                                                      steps=[RecordingStep("step", 1)]),
+            {}, _CREDS, worker_id="test-worker", transaction_db_path=db_path,
+            after_item=lambda item, transaction, error: callbacks.append((item.id, transaction, error)),
         )
-
-        with pytest.raises(MemoryError, match="binding exhausted memory") as exc_info:
-            run_queue_loop(
-                queue=MemoryErrorBindQueue(
-                    [_item("bind-fatal")],
-                    str(tmp_path / "queue.db"),
-                ),
-                engine=Engine(),
-                build_transaction=lambda item: Transaction(
-                    reference=item.reference,
-                    steps=[_SuccessStep("step", 1)],
-                ),
-                config={},
-                credentials=_CREDS,
-                worker_id="test-worker",
-                transaction_db_path=db_path,
-            )
-
-        assert exc_info.value.__notes__ == [
-            "initial transaction cleanup also raised RuntimeError: "
-            "initial transaction cleanup failed"
-        ]
+        assert summary.terminal_failed == 1
+        assert summary.persistence_errors == 1
+        assert queue.fail_retries == [False]
+        assert queue.get_item("invalid-id").transaction_id == ""
+        assert executed == []
+        assert len(callbacks) == 1
+        item_id, transaction, error = callbacks[0]
+        assert item_id == "invalid-id" and transaction is None
+        assert isinstance(error, Exception)
+        assert isinstance(error.__cause__, ExecutionValidationError)
+        assert Path(db_path).read_bytes() == before
+        assert serialize_transaction(load_transaction(existing.id, db_path, readonly=True)) == serialize_transaction(existing)
+        assert [transaction.id for transaction in list_transactions(db_path, readonly=True)] == [existing.id]
 
     def test_initial_transaction_persistence_failure_retries_without_binding(
         self,
@@ -1968,119 +1836,33 @@ class TestRunnerManagedTransactionPersistence:
         assert errors
         assert "initial save failed" in str(errors[0])
 
-    def test_bind_transaction_retries_transient_sqlite_lock(
-        self,
-        monkeypatch,
-        tmp_path,
-        caplog,
-    ) -> None:
-        db_path = str(tmp_path / "transactions.db")
-        logger = logging.getLogger("test.runner.bind.retry")
+    @pytest.mark.parametrize("recover", [False, True])
+    def test_initial_atomic_write_retries_transient_lock_boundedly(self, monkeypatch, tmp_path, recover) -> None:
+        import rpacore.persistence as persistence
+        real_write = persistence._write_transaction_rows
+        attempts = []
 
-        class LockedThenBindingQueue(_RecordingSqliteQueue):
-            def __init__(self, items: list[QueueItem], queue_db_path: str) -> None:
-                super().__init__(items, queue_db_path)
-                self.attempts = 0
-
-            def bind_transaction(
-                self,
-                item_id: str,
-                transaction_id: str,
-                *,
-                claimed_by: str,
-                claim_token: str,
-            ) -> None:
-                self.attempts += 1
-                if self.attempts < 3:
+        def write_then_lock(*args, **kwargs):
+            revision = real_write(*args, **kwargs)
+            if not kwargs.get("expected_revision"):
+                attempts.append(revision)
+                if not recover or len(attempts) < 3:
                     raise sqlite3.OperationalError("database is locked")
-                super().bind_transaction(
-                    item_id,
-                    transaction_id,
-                    claimed_by=claimed_by,
-                    claim_token=claim_token,
-                )
+            return revision
 
-        queue = LockedThenBindingQueue(
-            [_item("bind-lock")],
-            str(tmp_path / "queue.db"),
-        )
-
-        with caplog.at_level(logging.WARNING, logger=logger.name):
-            summary = run_queue_loop(
-                queue=queue,
-                engine=Engine(),
-                build_transaction=lambda item: Transaction(
-                    reference=item.reference,
-                    steps=[_SuccessStep("step", 1)],
-                ),
-                config={},
-                credentials=_CREDS,
-                worker_id="test-worker",
-                transaction_db_path=db_path,
-                logger=logger,
-            )
-
-        assert summary.completed == 1
-        assert summary.failed == 0
-        assert queue.attempts == 3
-        assert queue.bindings
-        assert queue._clock.sleeps == [0.05, 0.1]
-        bind_retries = [
-            record for record in caplog.records
-            if record.__dict__.get("event") == "queue_bind_transaction_retry"
-        ]
-        assert [record.__dict__.get("queue_item_id") for record in bind_retries] == ["bind-lock", "bind-lock"]
-        assert [record.__dict__.get("worker_id") for record in bind_retries] == ["test-worker", "test-worker"]
-
-    def test_non_transient_initial_cleanup_error_is_not_retried(
-        self,
-        monkeypatch,
-        tmp_path,
-    ) -> None:
+        monkeypatch.setattr(persistence, "_write_transaction_rows", write_then_lock)
+        queue = _RecordingSqliteQueue([_item("initial-lock")], str(tmp_path / "queue.db"))
         db_path = str(tmp_path / "transactions.db")
-        cleanup_attempts: list[str] = []
-
-        class FailingBindQueue(_RecordingSqliteQueue):
-            def bind_transaction(
-                self,
-                item_id: str,
-                transaction_id: str,
-                *,
-                claimed_by: str,
-                claim_token: str,
-            ) -> None:
-                raise RuntimeError("bind failed")
-
-        def _fail_delete(transaction_id: str, *, db_path: str) -> None:
-            cleanup_attempts.append(transaction_id)
-            raise sqlite3.OperationalError("disk I/O error")
-
-        monkeypatch.setattr(
-            runner_module,
-            "_delete_unbound_pending_transaction",
-            _fail_delete,
-        )
-        queue = FailingBindQueue(
-                [_item("cleanup")],
-                str(tmp_path / "queue.db"),
-            )
-        summary = run_queue_loop(
-            queue=queue,
-            engine=Engine(),
-            build_transaction=lambda item: Transaction(
-                reference=item.reference,
-                steps=[_SuccessStep("step", 1)],
-            ),
-            config={},
-            credentials=_CREDS,
-            worker_id="test-worker",
-            transaction_db_path=db_path,
-        )
-
-        assert summary.failed == 1
-        assert summary.persistence_errors == 1
-        assert len(cleanup_attempts) == 1
-        assert queue._clock.sleeps == []
+        summary = run_queue_loop(queue, Engine(), lambda item: Transaction(item.reference), {}, _CREDS,
+                                 worker_id="test-worker", transaction_db_path=db_path)
+        assert attempts == [1, 1, 1]
+        assert queue._clock.sleeps == [0.05, 0.1]
+        assert summary.completed == int(recover)
+        assert summary.persistence_errors == int(not recover)
+        assert bool(queue.get_item("initial-lock").transaction_id) is recover
+        assert len(list_transactions(db_path, readonly=True)) == int(recover)
+        if not recover:
+            assert queue.fail_retries == [True]
 
     def test_sqlite_retry_helper_logs_shape_and_delay(self, monkeypatch, caplog) -> None:
         clock = _RecordingClock()

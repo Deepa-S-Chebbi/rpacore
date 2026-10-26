@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -14,7 +15,6 @@ from rpacore import (
     BusinessException, Engine, ProcessContext, Step, Status, SystemException,
     Transaction, execute_transaction, save_transaction, serialize_transaction,
 )
-from rpacore.persistence import _delete_unbound_pending_transaction
 
 
 def invoke(capsys, db, command, *options, code=0):
@@ -222,7 +222,9 @@ def test_list_consumes_deleted_summaries_and_releases_query_before_load(tmp_path
             first = False
             # Real writes during the load phase would fail behind a held query lock.
             save_transaction(Transaction(id="new", reference="checkpoint"), path)
-            _delete_unbound_pending_transaction("0", db_path=path)
+            with closing(sqlite3.connect(path)) as conn, conn:
+                conn.execute("PRAGMA foreign_keys = ON")
+                conn.execute("DELETE FROM transactions WHERE id = ?", ("0",))
         return real_load(id, path, readonly=readonly)
     monkeypatch.setattr(operator, "load_transaction", load)
     page = invoke(capsys, db, "list", "--limit", "2", "--json")
@@ -254,7 +256,9 @@ def test_selected_record_deleted_before_load_fails(tmp_path, capsys, monkeypatch
     save_transaction(Transaction(id="selected", reference="selected"), str(db))
     real_load = operator.load_transaction
     def load(id, path, *, readonly):
-        _delete_unbound_pending_transaction(id, db_path=path)
+        with closing(sqlite3.connect(path)) as conn, conn:
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("DELETE FROM transactions WHERE id = ?", (id,))
         return real_load(id, path, readonly=readonly)
     monkeypatch.setattr(operator, "load_transaction", load)
     invoke(capsys, db, "export", "--transaction-id", "selected", "--format", format, code=1)

@@ -183,15 +183,29 @@ metadata. If a crash instead leaves a bound transaction durably successful
 before queue completion, reclaim completes the queue item without rerunning the
 Engine or appending another transaction lifecycle.
 
-Initial transaction persistence first validates the current queue token inside
-the same SQLite transaction that writes the pending transaction. Binding that
-new transaction id remains a second, token-guarded queue update with bounded
-retry for transient SQLite `locked` or `busy` errors. If binding still fails,
-the runner attempts to delete the unbound pending transaction before failing the
-queue item. If both binding and cleanup fail, the transaction row can remain in
-the transaction database without a queue item reference; this is logged as
-`transaction_initial_cleanup_error` with the queue item and transaction
-identifiers.
+Initial persistence validates the current queue token, requires an unused
+nonblank string transaction ID and an empty or matching queue binding, writes
+the pending snapshot, and binds the item in one SQLite transaction. Before any step runs,
+both the snapshot and binding commit together or neither does. This applies to
+shared-file storage and separate files attached under DELETE journals. Even an
+existing revision-zero transaction with the same definition identity is rejected;
+an ID collision terminally fails initialization without overwriting that record.
+Transient SQLite `locked` or `busy` errors retry the whole transaction within
+the bounded persistence retry policy. In-memory binding and revision become
+available only after commit.
+
+The persisted SQLite runner performs this binding directly inside its storage
+transaction; it no longer invokes `SqliteQueue.bind_transaction()` overrides
+as initialization callbacks. Direct `QueueProvider.bind_transaction()` and
+`SqliteQueue.bind_transaction()` calls retain their claim-guarded behavior.
+Move application observation to `build_transaction`, step code or `after_item`
+as appropriate; none is a transactional binding hook. Without transaction
+persistence, the runner still builds work without a durable binding.
+
+Older runtimes could leave an unbound pending transaction after a process crash
+between save and bind, or after binding and compensating cleanup both failed.
+Those existing orphan records remain audit data; this runtime prevents new
+initialization orphans and does not discover, delete or repair old ones.
 
 Queue claims are leases, not ownership forever. `SqliteQueue` uses
 `lease_timeout` to decide when an `IN_PROGRESS` item is abandoned and may be
@@ -244,6 +258,12 @@ callback failures do not change the intended `complete()` or `fail()`
 transition. Confirmed lease loss skips `after_item` because the worker no
 longer owns the item outcome. Fatal process signals from `after_item` propagate.
 User callbacks own their mutations and external side effects.
+
+When initial persistence rejects a blank/non-string or already-used transaction
+ID, `after_item` receives `transaction=None`; its error wraps an
+`ExecutionValidationError` in `error.__cause__`. The wrapper's private class is
+not a supported API. This validation failure terminally fails the item without
+retry, step execution or changes to existing transaction records.
 
 `on_finish` is a final summary observer. It receives `QueueRunSummary` exactly
 once from the runner's finalization path, including empty-queue runs and
@@ -544,13 +564,13 @@ the failed JSON result and job diagnostics in those cases. Package-import or
 identity failures may precede JSON publication; absent reports are not passing
 evidence, and reports from a previous attempt are discarded before validation.
 The gate checks supported migration fixtures, future-schema rejection,
-concurrent claims/checkpoints, interruption after a bound checkpoint, stale
-claim rejection and WAL conversion/rejection for shared and separate files.
+concurrent claims/checkpoints, interruption before and after initial commit,
+restart from a bound checkpoint, stale claim rejection and WAL
+conversion/rejection for shared and separate files.
 
 These probes preserve the existing stdlib/DELETE policy; they do not certify
-every SQLite build or filesystem, power-loss recovery, exactly-once external
-effects, or the initial transaction-save/queue-bind crash interval. No schema
-migration or examples-project update is required to run them.
+every SQLite build or filesystem, power-loss recovery or exactly-once external
+effects. No schema migration or examples-project update is required to run them.
 
 Rollback journal permits concurrent workers through SQLite's normal locking;
 RPA Core keeps claim, heartbeat, checkpoint, and transition transactions short
@@ -708,10 +728,9 @@ workers and restore both code and database files from the same pre-upgrade
 backup; never edit version markers or point an older runtime at the newer live
 files.
 
-Cleanup of an initial transaction whose queue binding failed is owned by the
-persistence module. It will delete only a pending transaction with no history.
-Started or otherwise durable execution truth is never eligible for that narrow
-cleanup path.
+Initial transaction creation and queue binding roll back together on failure;
+the runner requires no compensating deletion. Previously bound records and
+older unbound records are retained for audit.
 
 ## Crash Behavior
 
@@ -777,9 +796,8 @@ The runner retries only short-lived SQLite `OperationalError` messages that
 contain `locked` or `busy`. This bounded retry policy uses 3 attempts with
 0.05s then 0.10s sleeps before the final attempt, and each sleep is logged with
 the operation, item id, worker id, attempt, maximum attempts, and delay. The
-policy applies to transaction checkpoints, initial transaction persistence,
-initial transaction cleanup, queue transaction binding, queue lease renewal, and
-final queue `complete()`/`fail()` transitions. Other SQLite operational errors
+policy applies to transaction checkpoints, atomic initial persistence/binding,
+queue lease renewal, and final queue `complete()`/`fail()` transitions. Other SQLite operational errors
 remain loud and are not retried merely because they came from SQLite.
 
 Deterministic input and wiring failures are terminal queue outcomes. Invalid

@@ -14,6 +14,7 @@ from typing import Callable
 from rpacore._clock import _Clock, _SYSTEM_CLOCK
 from rpacore._definition import validate_definition_identity
 from rpacore._json_state import JsonStateError, validate_json_object
+from rpacore._queue_checkpoint import _load_transaction_revision, _save_queue_transaction_fenced
 from rpacore._sqlite_retry import is_transient_sqlite_lock, sqlite_retry_delay
 from rpacore._validation import type_error
 from rpacore.context import ProcessContext
@@ -24,10 +25,7 @@ from rpacore.logger import bind_log_context, get_logger
 from rpacore.notify import Notifier, dispatch
 from rpacore.persistence import (
     TransactionFenceError,
-    _delete_unbound_pending_transaction,
-    _load_transaction_revision,
     _prepare_transaction_database,
-    _save_queue_transaction_fenced,
     load_transaction,
 )
 from rpacore.queue import (
@@ -998,6 +996,7 @@ def _transaction_for_queue_item(
             queue_db_path=_require_sqlite_queue(queue).db_path,
             item=item,
             expected_revision=0,
+            initial=True,
             log=log,
             event="transaction_initial_persistence_retry",
             queue_item_id=item.id,
@@ -1024,103 +1023,10 @@ def _transaction_for_queue_item(
                 error,
                 retry=not isinstance(error, (ExecutionValidationError, JsonStateError)),
             ) from error
-        try:
-            error = _bind_transaction_with_retries(
-                queue,
-                item.id,
-                transaction.id,
-                claimed_by=item.claimed_by,
-                claim_token=item.claim_token,
-                log=log,
-                worker_id=worker_id,
-            )
-            if error is not None:
-                raise error
-        except BaseException as exc:
-            try:
-                cleanup_error: BaseException | None = _delete_transaction_with_retries(
-                    transaction.id,
-                    db_path=transaction_db_path,
-                    log=log,
-                    queue_item_id=item.id,
-                    worker_id=worker_id,
-                    clock=_clock_for_queue(queue),
-                )
-            except BaseException as raised_cleanup_error:
-                cleanup_error = raised_cleanup_error
-            if cleanup_error is not None:
-                summary.persistence_errors += 1
-                log.error(
-                    "Initial transaction cleanup failed after queue binding error",
-                    extra={
-                        "event": "transaction_initial_cleanup_error",
-                        "queue_item_id": item.id,
-                        "queue_reference": item.reference,
-                        "transaction_id": transaction.id,
-                        "transaction_reference": transaction.reference,
-                        "worker_id": worker_id,
-                    },
-                    exc_info=(type(cleanup_error), cleanup_error, cleanup_error.__traceback__),
-                )
-            if isinstance(exc, _FATAL_SIGNALS):
-                if cleanup_error is not None:
-                    _add_cleanup_failure_note(exc, "initial transaction", cleanup_error)
-                raise
-            if isinstance(cleanup_error, _FATAL_SIGNALS):
-                raise cleanup_error
-            if isinstance(exc, QueueLeaseLostError):
-                raise
-            if not isinstance(exc, Exception):
-                raise
-            raise _DurableTransactionBindingError(
-                f"Queue item {item.id!r} could not bind transaction {transaction.id!r}: {exc}"
-            ) from exc
-    item.transaction_id = transaction.id
     if revision is None:
         raise RuntimeError("Initial fenced transaction save returned no revision")
+    item.transaction_id = transaction.id
     return transaction, revision
-
-
-def _bind_transaction_with_retries(
-    queue: QueueProvider,
-    item_id: str,
-    transaction_id: str,
-    *,
-    claimed_by: str,
-    claim_token: str,
-    log: logging.Logger,
-    worker_id: str,
-) -> Exception | None:
-    """Bind a queue item to a transaction, retrying short-lived SQLite locks."""
-    for attempt in range(_LEASE_RENEW_ATTEMPTS):
-        try:
-            queue.bind_transaction(
-                item_id,
-                transaction_id,
-                claimed_by=claimed_by,
-                claim_token=claim_token,
-            )
-            return None
-        except sqlite3.OperationalError as exc:
-            if not is_transient_sqlite_lock(exc) or attempt == _LEASE_RENEW_ATTEMPTS - 1:
-                return exc
-            _sleep_before_sqlite_retry(
-                attempt,
-                clock=_clock_for_queue(queue),
-                delay_seconds=_LEASE_RETRY_DELAY_SECONDS,
-                log=log,
-                event="queue_bind_transaction_retry",
-                operation="bind_transaction",
-                queue_item_id=item_id,
-                worker_id=worker_id,
-                error=exc,
-                max_attempts=_LEASE_RENEW_ATTEMPTS,
-            )
-        except MemoryError:
-            raise
-        except Exception as exc:
-            return exc
-    return None
 
 
 def _seed_transaction_state_from_payload(
@@ -1292,6 +1198,7 @@ def _save_queue_transaction_with_retries(
     queue_item_id: str,
     worker_id: str,
     clock: _Clock,
+    initial: bool = False,
 ) -> tuple[int | None, Exception | None]:
     """Save a fenced queue transaction, retrying short-lived SQLite locks."""
     for attempt in range(_PERSISTENCE_SAVE_ATTEMPTS):
@@ -1304,6 +1211,7 @@ def _save_queue_transaction_with_retries(
                 claimed_by=item.claimed_by,
                 claim_token=item.claim_token,
                 expected_revision=expected_revision,
+                initial=initial,
             )
             return revision, None
         except sqlite3.OperationalError as exc:
@@ -1329,42 +1237,3 @@ def _save_queue_transaction_with_retries(
         except Exception as exc:
             return None, exc
     raise RuntimeError("Fenced transaction save exhausted without a result")
-
-
-def _delete_transaction_with_retries(
-    transaction_id: str,
-    *,
-    db_path: str,
-    log: logging.Logger,
-    queue_item_id: str,
-    worker_id: str,
-    clock: _Clock,
-) -> Exception | None:
-    """Delete a not-yet-bound transaction, retrying short-lived SQLite lock failures."""
-    for attempt in range(_PERSISTENCE_SAVE_ATTEMPTS):
-        try:
-            _delete_unbound_pending_transaction(transaction_id, db_path=db_path)
-            return None
-        except sqlite3.OperationalError as exc:
-            if (
-                not is_transient_sqlite_lock(exc)
-                or attempt == _PERSISTENCE_SAVE_ATTEMPTS - 1
-            ):
-                return exc
-            _sleep_before_sqlite_retry(
-                attempt,
-                clock=clock,
-                delay_seconds=_PERSISTENCE_RETRY_DELAY_SECONDS,
-                log=log,
-                event="transaction_initial_cleanup_retry",
-                operation="delete_transaction",
-                queue_item_id=queue_item_id,
-                worker_id=worker_id,
-                error=exc,
-                max_attempts=_PERSISTENCE_SAVE_ATTEMPTS,
-            )
-        except MemoryError:
-            raise
-        except Exception as exc:
-            return exc
-    return None

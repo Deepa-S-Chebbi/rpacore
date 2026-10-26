@@ -278,6 +278,21 @@ summary prose is for people rather than semantic parsing.
 | `QueueItem`, `QueueStatus`, `QueueLeaseLostError`, `QueueAdminEvent`, `QueueAttempt`, `QueueAttemptOutcome`, `QueuePoisonEvent`, `QueueProvider`, `SqliteQueue` | Queue item model, statuses, claim-loss error, audited overrides, attempt/disposition records, provider contract, and SQLite implementation. | `SqliteQueue` creates/migrates and mutates SQLite queue state. Every claim receives an opaque `claim_token`; claimed-worker mutations require the current token. Its `fail()` returns the durable `retry_scheduled` or `failed` attempt disposition; custom providers may return `None` when they cannot attest it. `list_attempts()` exposes one final outcome per post-v4 claim without fabricating history for older rows. |
 | `QueueRunSummary`, `run_queue_loop` | Process claimed queue items through user factories and `Engine`. Fatal `MemoryError`, `KeyboardInterrupt`, and `SystemExit` signals propagate after deterministic cleanup. | `processed` and `failed` remain compatibility aggregates. Use `retry_scheduled`, `terminal_failed`, `lease_lost`, and `transition_unknown` for disposition truth; unknown is never inferred from a requested retry flag. Mutates queue and transaction SQLite databases; renews leases; checkpoints transactions when `transaction_db_path` is configured. Durable queue checkpoints require `SqliteQueue` and atomically validate its claim token plus transaction revision. Every post-claim exit stops and joins its lease heartbeat. |
 
+With `transaction_db_path`, the SQLite runner creates the initial pending
+snapshot and queue binding in one commit, before executing steps. The new ID
+must be a nonblank string and unused, including by revision-zero records. An ID
+collision raises an execution validation failure and terminally fails the item without overwriting
+the existing record. Initialization bypasses `SqliteQueue.bind_transaction()`
+overrides; direct provider binding calls retain their behavior. Use the factory,
+step code or `after_item` for application observation at those lifecycle points;
+there is no transactional binding callback. No schema migration or
+examples-repository update is required. Existing orphan records are retained.
+
+If initial persistence rejects a blank/non-string or already-used ID,
+`after_item` receives `transaction=None` and an error whose `__cause__` is an
+`ExecutionValidationError`. The item fails terminally without queue retry. The
+wrapper's private class is not part of the supported API.
+
 `QueuePage[T]` has `records: tuple[T, ...]`, `has_more: bool`,
 `next_cursor: str | None` and `format_version: int` (currently `1`). Limits are
 integers from 1 through 1000. Item `statuses` takes a union of `QueueStatus`

@@ -59,6 +59,15 @@ All notable user-facing changes are recorded here.
 
 ### Fixed
 
+- Persisted SQLite queue initialization now commits the initial pending
+  transaction and its item binding together, in shared or separate database
+  files, before steps run. It rejects every existing transaction ID, including
+  revision-zero records, without overwriting it. This closes the process-crash
+  save/bind window; old orphan records remain audit data. The runner now bypasses
+  `bind_transaction` overrides during persisted initialization; direct binding
+  calls retain their behavior. Move application observation to the factory,
+  step code or `after_item` as appropriate. No schema migration, dependency or
+  examples-repository update is required.
 - New generated entrypoints explicitly build and inject the configured credential
   provider before durable work. The default remains env; construction and the
   greeting read no secrets. Existing projects can add explicit provider injection
