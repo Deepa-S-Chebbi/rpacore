@@ -238,6 +238,13 @@ separators; for example, `queue_run_completed` is
 `rpacore.queue.run_completed` in v3. Old JSON log format selection is no longer
 available.
 
+Runner claim retries use `queue_claim_retry` (`rpacore.queue.claim.retry` in
+JSON v3). A propagating run failure uses `queue_run_aborted`
+(`rpacore.queue.run.aborted`) at ERROR, with partial claim/transition counts.
+Normal returns retain the completion event above. See the
+[runner failure policy](durability.md#runner-failure-policy) for the three-call
+SQLite claim budget and the single-call custom-provider boundary.
+
 `bind_log_context()` temporarily attaches approved scalar correlation fields
 such as transaction, queue-item, worker, step, retry, and attempt identifiers.
 Nested scopes restore the prior context even when execution raises. Context is

@@ -655,13 +655,13 @@ class SqliteQueue:
                     claimed_by=worker_id,
                     started_at=now,
                 )
-                conn.execute("COMMIT")
-                transaction_started = False
-
                 updated = conn.execute(
                     "SELECT * FROM queue_items WHERE id = ?", (row["id"],)
                 ).fetchone()
-                return row_to_item(updated, payload=payload)
+                item = row_to_item(updated, payload=payload)
+                conn.execute("COMMIT")
+                transaction_started = False
+                return item
         except Exception:
             if transaction_started:
                 conn.execute("ROLLBACK")

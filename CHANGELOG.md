@@ -59,6 +59,15 @@ All notable user-facing changes are recorded here.
 
 ### Fixed
 
+- Queue runners retry built-in SQLite claim lock/busy failures with three total
+  attempts and 0.05/0.1-second waits, checking for stop before each call. Custom
+  providers and overridden claim methods retain single-call behavior. Claim
+  preparation now precedes commit, so read/decoding failures cannot strand a new
+  claim. Propagating run errors emit an ERROR abort event with partial counts
+  instead of normal completion, including fatal final-summary callbacks. JSON
+  log v3 names the new events `rpacore.queue.claim.retry` and
+  `rpacore.queue.run.aborted`. Public signatures and schemas are unchanged;
+  no migration, dependency or examples-repository update is required.
 - Persisted SQLite queue initialization now commits the initial pending
   transaction and its item binding together, in shared or separate database
   files, before steps run. It rejects every existing transaction ID, including

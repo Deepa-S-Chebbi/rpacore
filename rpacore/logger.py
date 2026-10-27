@@ -49,6 +49,8 @@ _LOG_CONTEXT: ContextVar[dict[str, str | int]] = ContextVar(
     default={},
 )
 _EVENT_NAMES = {
+    "queue_claim_retry": "rpacore.queue.claim.retry",
+    "queue_run_aborted": "rpacore.queue.run.aborted",
     "queue_run_completed": "rpacore.queue.run_completed",
 }
 _OWNED_HANDLER_ATTRIBUTE = "_rpacore_owned_handler"

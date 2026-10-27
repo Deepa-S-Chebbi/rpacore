@@ -247,6 +247,30 @@ shared runtime resources. It is entered before queue claims and exited after
 item processing. Setup failures prevent queue claims. Cleanup failures propagate
 after already-decided queue outcomes.
 
+For the built-in `SqliteQueue.next_item` method, the runner retries transient
+SQLite lock/busy claim failures with at most three total calls and two waits
+of 0.05 and 0.1 seconds. A subclass inheriting that method receives the same
+handling. Custom providers and overridden claim methods are called once, since
+an exception from them may follow a committed claim. Direct calls to
+`SqliteQueue.next_item` remain single-attempt. The runner checks `stop_event`
+before every call, including after a retry wait. SQLite's one-second connection
+busy timeout still applies; this attempt budget is not a hard elapsed-time limit.
+
+Built-in claims prepare the returned item before committing the item and its
+attempt together. A failed read, decoding operation or commit rolls back that
+new claim. Exhausted lock errors and other claim failures propagate without
+counting an unclaimed item as processed or failed. `after_item` is not called
+for an unsuccessful claim; `on_finish` still receives counts for work already
+claimed. Queue delivery and external effects remain at least once.
+
+Retry diagnostics use `queue_claim_retry`, with worker, attempt, maximum attempts
+and wait duration, without payload or claim token. A normal return, including
+empty queues, graceful stops and ordinary errors suppressed by `resource_scope`,
+logs `queue_run_completed`. A propagating error, including a fatal `on_finish`
+error, logs `queue_run_aborted` at ERROR with the partial counts and exception.
+JSON log v3 names these new events `rpacore.queue.claim.retry` and
+`rpacore.queue.run.aborted`; completion retains `rpacore.queue.run_completed`.
+
 `after_item` is a per-item observer for ordinary item outcomes. It receives
 `(QueueItem, Transaction | None, Exception | None)` after execution,
 checkpointing, report generation, and notification dispatch, immediately before
@@ -283,6 +307,7 @@ Runner failure dispositions:
 | Boundary | Ordinary outcome | Fatal signal outcome |
 | --- | --- | --- |
 | resource setup | propagates before queue claim | propagates |
+| queue claim | built-in SQLite lock/busy retries up to three total calls; exhaustion, other errors and custom-provider errors propagate without item failure counts | propagates |
 | transaction build | item fails with queue retry unless validation is terminal | propagates |
 | payload/state validation | terminal queue failure without retry | propagates |
 | engine system failure | queue failure with retry | propagates |
@@ -795,9 +820,13 @@ argument.
 The runner retries only short-lived SQLite `OperationalError` messages that
 contain `locked` or `busy`. This bounded retry policy uses 3 attempts with
 0.05s then 0.10s sleeps before the final attempt, and each sleep is logged with
-the operation, item id, worker id, attempt, maximum attempts, and delay. The
-policy applies to transaction checkpoints, atomic initial persistence/binding,
-queue lease renewal, and final queue `complete()`/`fail()` transitions. Other SQLite operational errors
+the operation, worker id, attempt, maximum attempts, and delay. An item id is
+included after a claim; claim retries have no item yet and use an empty item id.
+The policy applies to built-in SQLite claims made by the runner, transaction
+checkpoints, atomic initial persistence/binding, queue lease renewal, and final
+queue `complete()`/`fail()` transitions. Direct claim calls and overridden or
+custom-provider claim methods remain single-attempt, as described in the
+[Runner Failure Policy](#runner-failure-policy). Other SQLite operational errors
 remain loud and are not retried merely because they came from SQLite.
 
 Deterministic input and wiring failures are terminal queue outcomes. Invalid

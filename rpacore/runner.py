@@ -15,7 +15,7 @@ from rpacore._clock import _Clock, _SYSTEM_CLOCK
 from rpacore._definition import validate_definition_identity
 from rpacore._json_state import JsonStateError, validate_json_object
 from rpacore._queue_checkpoint import _load_transaction_revision, _save_queue_transaction_fenced
-from rpacore._sqlite_retry import is_transient_sqlite_lock, sqlite_retry_delay
+from rpacore._sqlite_retry import _sleep_before_sqlite_retry, is_transient_sqlite_lock
 from rpacore._validation import type_error
 from rpacore.context import ProcessContext
 from rpacore.credentials import CredentialProvider
@@ -45,6 +45,8 @@ _PERSISTENCE_SAVE_ATTEMPTS = 3
 _PERSISTENCE_RETRY_DELAY_SECONDS = 0.05
 _LEASE_RENEW_ATTEMPTS = 3
 _LEASE_RETRY_DELAY_SECONDS = 0.05
+_CLAIM_ATTEMPTS = 3
+_CLAIM_RETRY_DELAY_SECONDS = 0.05
 _DEFAULT_LEASE_RENEWAL_INTERVAL_SECONDS = 10.0
 
 # Cleanup precedence:
@@ -203,6 +205,7 @@ def run_queue_loop(
         worker_id = socket.gethostname()
     _notifiers: list[Notifier] = notifiers if notifiers is not None else []
     summary = QueueRunSummary()
+    run_error: BaseException | None = None
 
     try:
         if transaction_db_path is not None:
@@ -265,36 +268,46 @@ def run_queue_loop(
             resource_scope.__exit__(None, None, None)
         _log_resource_scope(log, "resource_scope_released", worker_id, shared_resources)
         return result
+    except BaseException as error:
+        run_error = error
+        raise
     finally:
-        active_error = sys.exception()
-        if on_finish is not None:
-            try:
-                on_finish(summary)
-            except _FATAL_SIGNALS as cleanup_error:
-                if isinstance(active_error, _FATAL_SIGNALS):
-                    _add_cleanup_failure_note(active_error, "on_finish", cleanup_error)
-                else:
-                    raise
-            except Exception:
-                summary.lifecycle_errors += 1
-                log.exception(
-                    "on_finish callback raised during lifecycle cleanup",
-                    extra={"event": "on_finish_error", "worker_id": worker_id},
-                )
-        log.info(
-            "Queue run completed",
-            extra={
-                "event": "queue_run_completed",
-                "worker_id": worker_id,
-                "processed": summary.processed,
-                "completed": summary.completed,
-                "failed": summary.failed,
-                "retry_scheduled": summary.retry_scheduled,
-                "terminal_failed": summary.terminal_failed,
-                "lease_lost": summary.lease_lost,
-                "transition_unknown": summary.transition_unknown,
-            },
-        )
+        try:
+            if on_finish is not None:
+                try:
+                    on_finish(summary)
+                except _FATAL_SIGNALS as cleanup_error:
+                    if isinstance(run_error, _FATAL_SIGNALS):
+                        _add_cleanup_failure_note(run_error, "on_finish", cleanup_error)
+                    else:
+                        raise
+                except Exception:
+                    summary.lifecycle_errors += 1
+                    log.exception(
+                        "on_finish callback raised during lifecycle cleanup",
+                        extra={"event": "on_finish_error", "worker_id": worker_id},
+                    )
+        except BaseException as error:
+            run_error = error
+            raise
+        finally:
+            log.log(
+                logging.ERROR if run_error is not None else logging.INFO,
+                "Queue run aborted" if run_error is not None else "Queue run completed",
+                extra={
+                    "event": "queue_run_aborted" if run_error is not None else "queue_run_completed",
+                    "worker_id": worker_id,
+                    "processed": summary.processed,
+                    "completed": summary.completed,
+                    "failed": summary.failed,
+                    "retry_scheduled": summary.retry_scheduled,
+                    "terminal_failed": summary.terminal_failed,
+                    "lease_lost": summary.lease_lost,
+                    "transition_unknown": summary.transition_unknown,
+                },
+                exc_info=(type(run_error), run_error, run_error.__traceback__)
+                if run_error is not None else None,
+            )
 
 
 def _add_cleanup_failure_note(
@@ -328,9 +341,7 @@ def _run_items(
 ) -> QueueRunSummary:
     """Process queue items after lifecycle startup has completed."""
     while True:
-        if stop_event is not None and stop_event.is_set():
-            break
-        item = queue.next_item(worker_id)
+        item = _next_item_with_retries(queue, worker_id=worker_id, log=log, stop_event=stop_event)
         if item is None:
             break
 
@@ -365,6 +376,42 @@ def _run_items(
             break
 
     return summary
+
+
+def _next_item_with_retries(
+    queue: QueueProvider,
+    *,
+    worker_id: str,
+    log: logging.Logger,
+    stop_event: threading.Event | None,
+) -> QueueItem | None:
+    """Retry only the built-in claim, whose lock failures leave no new claim."""
+    claim = queue.next_item
+    can_retry = (
+        isinstance(queue, SqliteQueue)
+        and getattr(claim, "__func__", None) is SqliteQueue.next_item
+    )
+    for attempt in range(_CLAIM_ATTEMPTS):
+        if stop_event is not None and stop_event.is_set():
+            return None
+        try:
+            return claim(worker_id)
+        except sqlite3.OperationalError as error:
+            if not can_retry or not is_transient_sqlite_lock(error) or attempt == _CLAIM_ATTEMPTS - 1:
+                raise
+            _sleep_before_sqlite_retry(
+                attempt,
+                clock=_clock_for_queue(queue),
+                delay_seconds=_CLAIM_RETRY_DELAY_SECONDS,
+                log=log,
+                event="queue_claim_retry",
+                operation="next_item",
+                queue_item_id="",
+                worker_id=worker_id,
+                error=error,
+                max_attempts=_CLAIM_ATTEMPTS,
+            )
+    raise RuntimeError("Queue claim exhausted without a result")
 
 
 def _run_claimed_item(
@@ -872,36 +919,6 @@ def _fail_queue_item_with_retries(
         except Exception as exc:
             return None, exc
     return None, RuntimeError("Queue fail transition exhausted without a result")
-
-
-def _sleep_before_sqlite_retry(
-    attempt: int,
-    *,
-    clock: _Clock,
-    delay_seconds: float,
-    log: logging.Logger,
-    event: str,
-    operation: str,
-    queue_item_id: str,
-    worker_id: str,
-    error: sqlite3.OperationalError,
-    max_attempts: int,
-) -> None:
-    delay = sqlite_retry_delay(attempt, base_delay_seconds=delay_seconds)
-    log.warning(
-        "Retrying transient SQLite operation after lock/busy error",
-        extra={
-            "event": event,
-            "operation": operation,
-            "queue_item_id": queue_item_id,
-            "worker_id": worker_id,
-            "attempt": attempt + 1,
-            "max_attempts": max_attempts,
-            "retry_delay_seconds": delay,
-        },
-        exc_info=(type(error), error, error.__traceback__),
-    )
-    clock.sleep(delay)
 
 
 def _log_lease_lost(

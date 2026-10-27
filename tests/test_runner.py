@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import sqlite3
 import tempfile
 import threading
@@ -25,6 +26,7 @@ from rpacore.exceptions import (
     SystemException,
 )
 from rpacore.persistence import list_transactions, load_transaction, save_transaction
+from rpacore.logger import JsonFormatter
 from rpacore.queue import (
     QueueAttemptOutcome,
     QueueItem,
@@ -33,6 +35,8 @@ from rpacore.queue import (
     SqliteQueue,
 )
 import rpacore.runner as runner_module
+import rpacore.queue as queue_module
+import rpacore._sqlite_retry as sqlite_retry_module
 from rpacore.runner import QueueRunSummary, run_queue_loop
 from rpacore.serialization import serialize_transaction
 from rpacore.step import Step
@@ -271,6 +275,247 @@ def _resource_scope(resources: dict[str, object] | None):
 # ---------------------------------------------------------------------------
 # QueueRunSummary counts
 # ---------------------------------------------------------------------------
+
+class TestClaimContention:
+    @pytest.mark.parametrize("recover", [False, True])
+    def test_builtin_claim_retries_have_fixed_budget(self, tmp_path, monkeypatch, caplog, recover):
+        queue = _RecordingSqliteQueue([_item("claim")], str(tmp_path / "queue.db"))
+        connect = queue_module._connect
+        error = sqlite3.OperationalError("database is locked")
+        calls = []
+
+        def contended_connect(path):
+            calls.append(path)
+            if not recover or len(calls) < 3:
+                raise error
+            return connect(path)
+
+        monkeypatch.setattr(queue_module, "_connect", contended_connect)
+        with caplog.at_level(logging.WARNING):
+            if recover:
+                item = runner_module._next_item_with_retries(
+                    queue, worker_id="worker", log=logging.getLogger("test.claim"), stop_event=None,
+                )
+                assert item.id == "claim"
+            else:
+                with pytest.raises(sqlite3.OperationalError) as raised:
+                    runner_module._next_item_with_retries(
+                        queue, worker_id="worker", log=logging.getLogger("test.claim"), stop_event=None,
+                    )
+                assert raised.value is error
+        assert len(calls) == 3
+        assert queue._clock.sleeps == [0.05, 0.1]
+        retries = [r for r in caplog.records if getattr(r, "event", None) == "queue_claim_retry"]
+        assert [r.attempt for r in retries] == [1, 2]
+        assert [r.retry_delay_seconds for r in retries] == [0.05, 0.1]
+        assert all(r.max_attempts == 3 and r.operation == "next_item" for r in retries)
+        assert all(r.worker_id == "worker" and not r.queue_item_id for r in retries)
+        assert all("claim_token" not in r.__dict__ and "payload" not in r.__dict__ for r in retries)
+        monkeypatch.setattr(queue_module, "_connect", connect)
+        assert len(queue.list_attempts("claim")) == int(recover)
+        assert queue.get_item("claim").status is (QueueStatus.IN_PROGRESS if recover else QueueStatus.PENDING)
+
+    def test_empty_builtin_queue_does_not_retry(self, tmp_path, monkeypatch):
+        queue = _RecordingSqliteQueue([], str(tmp_path / "queue.db"))
+        connect = queue_module._connect
+        calls = []
+
+        def count_connect(path):
+            calls.append(path)
+            return connect(path)
+
+        monkeypatch.setattr(queue_module, "_connect", count_connect)
+        assert runner_module._next_item_with_retries(
+            queue, worker_id="worker", log=logging.getLogger("test.claim"), stop_event=None,
+        ) is None
+        assert len(calls) == 1
+        assert queue._clock.sleeps == []
+
+    def test_stop_during_retry_prevents_another_claim(self, tmp_path, monkeypatch):
+        queue = _RecordingSqliteQueue([_item("stop")], str(tmp_path / "queue.db"))
+        stop = threading.Event()
+        calls = []
+
+        def locked(path):
+            calls.append(path)
+            raise sqlite3.OperationalError("database is busy")
+
+        monkeypatch.setattr(queue_module, "_connect", locked)
+        monkeypatch.setattr(queue._clock, "sleep", lambda seconds: stop.set())
+        assert runner_module._next_item_with_retries(
+            queue, worker_id="worker", log=logging.getLogger("test.claim"), stop_event=stop,
+        ) is None
+        assert len(calls) == 1
+
+    @pytest.mark.parametrize("provider", ["custom", "subclass", "instance"])
+    def test_overridden_claim_is_not_replayed(self, tmp_path, provider):
+        error = sqlite3.OperationalError("database is locked")
+        calls = []
+
+        def unsafe_claim(worker_id=""):
+            calls.append(worker_id)
+            raise error
+
+        class Override(SqliteQueue):
+            def next_item(self, worker_id=""):
+                return unsafe_claim(worker_id)
+
+        if provider == "custom":
+            queue = _FakeQueue([])
+            queue.next_item = unsafe_claim
+        elif provider == "subclass":
+            queue = Override({"db_path": str(tmp_path / "queue.db")})
+        else:
+            queue = SqliteQueue({"db_path": str(tmp_path / "queue.db")})
+            queue.next_item = unsafe_claim
+        with pytest.raises(sqlite3.OperationalError) as raised:
+            run_queue_loop(queue, Engine(), lambda item: Transaction(item.reference), {}, _CREDS)
+        assert raised.value is error
+        assert len(calls) == 1
+
+    @pytest.mark.parametrize("error", [sqlite3.OperationalError("disk I/O error"), MemoryError("fatal")])
+    def test_nontransient_builtin_claim_errors_are_not_retried(self, tmp_path, monkeypatch, error):
+        queue = _RecordingSqliteQueue([_item("error")], str(tmp_path / "queue.db"))
+        calls = []
+
+        def fail(path):
+            calls.append(path)
+            raise error
+
+        monkeypatch.setattr(queue_module, "_connect", fail)
+        with pytest.raises(type(error)) as raised:
+            run_queue_loop(queue, Engine(), lambda item: Transaction(item.reference), {}, _CREDS)
+        assert raised.value is error
+        assert len(calls) == 1
+        assert queue._clock.sleeps == []
+
+    @pytest.mark.parametrize("completed_before_abort", [0, 1])
+    def test_aborted_log_and_final_summary_preserve_claim_counts(self, caplog, completed_before_abort):
+        calls = 0
+        error = RuntimeError("claim unavailable")
+
+        class FailingQueue(_FakeQueue):
+            def next_item(self, worker_id=""):
+                nonlocal calls
+                calls += 1
+                if calls > completed_before_abort:
+                    raise error
+                return super().next_item(worker_id)
+
+        summaries = []
+        with caplog.at_level(logging.INFO), pytest.raises(RuntimeError) as raised:
+            run_queue_loop(FailingQueue([_item("first")]), Engine(),
+                           lambda item: Transaction(item.reference, steps=[_SuccessStep("step", 1)]),
+                           {}, _CREDS, on_finish=summaries.append, logger=logging.getLogger("test.claim.lifecycle"))
+        assert raised.value is error
+        assert summaries == [QueueRunSummary(processed=completed_before_abort, completed=completed_before_abort)]
+        terminal = [r for r in caplog.records if getattr(r, "event", "").startswith("queue_run_")]
+        assert len(terminal) == 1
+        assert terminal[0].event == "queue_run_aborted" and terminal[0].levelno == logging.ERROR
+        assert terminal[0].processed == terminal[0].completed == completed_before_abort
+        assert terminal[0].failed == 0
+
+    @pytest.mark.parametrize("error", [KeyboardInterrupt("finish"), GeneratorExit("finish")])
+    def test_propagating_finish_error_after_success_emits_abort(self, caplog, error):
+        summaries = []
+
+        def finish(summary):
+            summaries.append(summary)
+            raise error
+
+        with caplog.at_level(logging.INFO), pytest.raises(type(error)) as raised:
+            _run([_item("done")], on_finish=finish, logger=logging.getLogger("test.claim.lifecycle"))
+        assert raised.value is error
+        assert summaries == [QueueRunSummary(processed=1, completed=1)]
+        assert [r.event for r in caplog.records if getattr(r, "event", "").startswith("queue_run_")] == ["queue_run_aborted"]
+
+    @pytest.mark.parametrize("finish_type", [SystemExit, KeyboardInterrupt, GeneratorExit])
+    def test_finish_error_keeps_body_failure_in_abort_traceback(self, caplog, finish_type):
+        body_error = RuntimeError("synthetic body failure")
+        finish_error = finish_type("synthetic finish failure")
+
+        class BrokenQueue(_FakeQueue):
+            def next_item(self, worker_id=""):
+                raise body_error
+
+        def finish(summary):
+            raise finish_error
+
+        with caplog.at_level(logging.INFO), pytest.raises(finish_type) as raised:
+            run_queue_loop(
+                BrokenQueue([]), Engine(), lambda item: Transaction(item.reference), {}, _CREDS,
+                logger=logging.getLogger("test.claim.lifecycle"), on_finish=finish,
+            )
+        assert raised.value is finish_error
+        assert finish_error.__context__ is body_error
+        terminal = [r for r in caplog.records if getattr(r, "event", "").startswith("queue_run_")]
+        assert len(terminal) == 1
+        assert terminal[0].event == "queue_run_aborted" and terminal[0].levelno == logging.ERROR
+        assert terminal[0].exc_info[1] is finish_error
+        trace = json.loads(JsonFormatter().format(terminal[0]))["exception"]["stacktrace"]
+        assert "RuntimeError: synthetic body failure" in trace
+        assert f"{finish_type.__name__}: synthetic finish failure" in trace
+
+    @pytest.mark.parametrize("fatal_type", [KeyboardInterrupt, MemoryError, SystemExit])
+    def test_fatal_body_error_logs_one_abort(self, caplog, fatal_type):
+        error = fatal_type("synthetic processing failure")
+        with caplog.at_level(logging.INFO), pytest.raises(fatal_type) as raised:
+            _run([_item("fatal")], build_raises=error, logger=logging.getLogger("test.claim.lifecycle"))
+        assert raised.value is error
+        terminal = [r for r in caplog.records if getattr(r, "event", "").startswith("queue_run_")]
+        assert len(terminal) == 1
+        assert terminal[0].event == "queue_run_aborted" and terminal[0].levelno == logging.ERROR
+        assert terminal[0].exc_info[1] is error
+
+    def test_stop_before_first_claim_logs_completion(self, caplog):
+        calls = []
+
+        class CountingQueue(_FakeQueue):
+            def next_item(self, worker_id=""):
+                calls.append(worker_id)
+                return super().next_item(worker_id)
+
+        stop = threading.Event()
+        stop.set()
+        with caplog.at_level(logging.INFO):
+            summary = run_queue_loop(
+                CountingQueue([_item("pending")]), Engine(), lambda item: Transaction(item.reference), {}, _CREDS,
+                logger=logging.getLogger("test.claim.lifecycle"), stop_event=stop,
+            )
+        assert calls == [] and summary == QueueRunSummary()
+        terminal = [r for r in caplog.records if getattr(r, "event", "").startswith("queue_run_")]
+        assert len(terminal) == 1
+        assert terminal[0].event == "queue_run_completed" and terminal[0].levelno == logging.INFO
+
+    def test_normal_run_inside_callers_exception_handler_logs_completion(self, caplog):
+        with caplog.at_level(logging.INFO):
+            try:
+                raise ValueError("caller handles this")
+            except ValueError:
+                _run([], logger=logging.getLogger("test.claim.lifecycle"))
+        assert [r.event for r in caplog.records if getattr(r, "event", "").startswith("queue_run_")] == ["queue_run_completed"]
+
+    def test_suppressed_claim_failure_logs_normal_completion(self, caplog):
+        class FailingQueue(_FakeQueue):
+            def next_item(self, worker_id=""):
+                raise RuntimeError("suppressed by resource owner")
+
+        @contextmanager
+        def scope():
+            try:
+                yield {}
+            except RuntimeError:
+                pass
+
+        summaries = []
+        with caplog.at_level(logging.INFO):
+            result = run_queue_loop(
+                FailingQueue([]), Engine(), lambda item: Transaction(item.reference), {}, _CREDS,
+                logger=logging.getLogger("test.claim.lifecycle"), resource_scope=scope(), on_finish=summaries.append,
+            )
+        assert summaries == [result] == [QueueRunSummary()]
+        assert [r.event for r in caplog.records if getattr(r, "event", "").startswith("queue_run_")] == ["queue_run_completed"]
+
 
 class TestQueueRunSummary:
     def test_empty_queue_returns_zero_counts(self) -> None:
@@ -1870,7 +2115,7 @@ class TestRunnerManagedTransactionPersistence:
         error = sqlite3.OperationalError("database is locked")
 
         with caplog.at_level(logging.WARNING, logger=logger.name):
-            runner_module._sleep_before_sqlite_retry(
+            sqlite_retry_module._sleep_before_sqlite_retry(
                 2,
                 clock=clock,
                 delay_seconds=0.25,
@@ -2311,26 +2556,11 @@ class TestRunnerManagedTransactionPersistence:
         assert isinstance(errors[0], TypeError)
         assert "transaction.state['client'] expected JSON value" in str(errors[0])
 
-    def test_payload_state_collision_is_logged_at_warning(self) -> None:
+    def test_payload_state_collision_is_logged_at_warning(self, caplog) -> None:
         item = _item("ok")
         item.payload = {"invoice_id": "payload"}
-        warning_extras: list[dict[str, object]] = []
-
-        class _CaptureLogger:
-            def debug(self, message: str, *, extra: dict[str, object]) -> None:
-                pass
-
-            def info(self, message: str, *, extra: dict[str, object]) -> None:
-                pass
-
-            def warning(self, message: str, *, extra: dict[str, object]) -> None:
-                warning_extras.append(extra)
-
-            def error(self, *args, **kwargs) -> None:
-                pass
-
-            def exception(self, *args, **kwargs) -> None:
-                pass
+        logger = logging.getLogger("test.runner.payload.collision")
+        caplog.set_level(logging.WARNING, logger=logger.name)
 
         def _build(queue_item: QueueItem) -> Transaction:
             return Transaction(
@@ -2346,12 +2576,13 @@ class TestRunnerManagedTransactionPersistence:
             config={},
             credentials=_CREDS,
             worker_id="worker",
-            logger=_CaptureLogger(),  # type: ignore[arg-type]
+            logger=logger,
         )
 
-        assert len(warning_extras) == 1
-        assert warning_extras[0]["event"] == "queue_payload_state_collision"
-        assert warning_extras[0]["state_keys"] == ["invoice_id"]
+        warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert warnings[0].event == "queue_payload_state_collision"
+        assert warnings[0].state_keys == ["invoice_id"]
 
 
 # ---------------------------------------------------------------------------

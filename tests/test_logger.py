@@ -555,6 +555,15 @@ class TestEngineLogging:
 
 
 class TestRunnerLogging:
+    @pytest.mark.parametrize(("event", "expected"), [
+        ("queue_claim_retry", "rpacore.queue.claim.retry"),
+        ("queue_run_aborted", "rpacore.queue.run.aborted"),
+        ("queue_run_completed", "rpacore.queue.run_completed"),
+    ])
+    def test_published_queue_event_names(self, event, expected):
+        record = logging.makeLogRecord({"msg": "synthetic event", "event": event})
+        assert json.loads(JsonFormatter().format(record))["event"] == expected
+
     def test_v3_queue_run_completion_has_summary_attributes(self) -> None:
         stream = io.StringIO()
         logger = configure_logger(

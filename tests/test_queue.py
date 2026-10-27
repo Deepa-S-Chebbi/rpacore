@@ -68,6 +68,85 @@ def claim_from_spawned_process(db_path: str, worker_id: str, results) -> None:
 # TestSqliteQueueConfig
 # ---------------------------------------------------------------------------
 
+
+@pytest.mark.parametrize("failure_phase", ["decode", "commit"])
+def test_failed_claim_preparation_rolls_back_item_and_attempt(tmp_path, monkeypatch, failure_phase):
+    queue = make_queue(tmp_path)
+    queued = make_item("rollback-claim")
+    queue.add(queued)
+    error = sqlite3.OperationalError("database is locked")
+    connect = queue_module._connect
+    decode = queue_module.row_to_item
+    decode_count = 0
+
+    def prepare_item(*args, **kwargs):
+        nonlocal decode_count
+        decode_count += 1
+        if failure_phase == "decode":
+            raise error
+        return decode(*args, **kwargs)
+
+    class FailedCommit(sqlite3.Connection):
+        def execute(self, sql, *args, **kwargs):
+            if sql == "COMMIT" and decode_count:
+                raise error
+            return super().execute(sql, *args, **kwargs)
+
+    def failing_connect(path):
+        connection = sqlite3.connect(path, factory=FailedCommit)
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    monkeypatch.setattr(queue_module, "row_to_item", prepare_item)
+    if failure_phase == "commit":
+        monkeypatch.setattr(queue_module, "_connect", failing_connect)
+    with pytest.raises(sqlite3.OperationalError) as raised:
+        queue.next_item("worker")
+    assert raised.value is error
+    assert decode_count == 1
+    monkeypatch.setattr(queue_module, "row_to_item", decode)
+    monkeypatch.setattr(queue_module, "_connect", connect)
+    stored = queue.get_item(queued.id)
+    assert stored.status is QueueStatus.PENDING
+    assert stored.claim_token == stored.claimed_by == stored.transaction_id == ""
+    assert stored.retry_count == 0
+    assert queue.list_attempts(queued.id) == []
+
+    recovered = queue.next_item("worker-recovered")
+    assert recovered is not None and recovered.id == queued.id
+    assert len(queue.list_attempts(queued.id)) == 1
+    queue.complete(recovered.id, claimed_by=recovered.claimed_by, claim_token=recovered.claim_token)
+    assert queue.get_item(queued.id).status is QueueStatus.SUCCESSFUL
+    assert queue.list_attempts(queued.id)[0].outcome is QueueAttemptOutcome.SUCCESSFUL
+
+
+def test_direct_next_item_does_not_retry_locked_claim(tmp_path, monkeypatch, caplog):
+    queue = make_queue(tmp_path)
+    queued = make_item("direct-lock")
+    queue.add(queued)
+    queue._clock = _ManualClock(datetime.now(timezone.utc))
+    connect = queue_module._connect
+    calls = []
+
+    def count_connect(path):
+        calls.append(path)
+        return connect(path)
+
+    monkeypatch.setattr(queue_module, "_connect", count_connect)
+    lock = sqlite3.connect(queue.db_path)
+    try:
+        lock.execute("BEGIN IMMEDIATE")
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            queue.next_item("direct-worker")
+    finally:
+        lock.rollback()
+        lock.close()
+    assert len(calls) == 1
+    assert queue._clock.sleeps == []
+    assert not any(getattr(record, "event", None) == "queue_claim_retry" for record in caplog.records)
+    assert queue.get_item(queued.id).status is QueueStatus.PENDING
+    assert queue.list_attempts(queued.id) == []
+
 class TestSqliteQueueConfig:
     def test_default_config(self, tmp_path):
         q = make_queue(tmp_path)

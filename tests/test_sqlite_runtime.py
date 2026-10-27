@@ -1,5 +1,6 @@
 """Real-process SQLite policy probes, also copied into installed-wheel gates."""
 
+import json
 import os
 import sqlite3
 import subprocess
@@ -17,6 +18,98 @@ from rpacore import (
     load_transaction, save_transaction,
 )
 from rpacore.persistence import _prepare_transaction_database
+
+
+_CLAIM_WORKER = """
+import json, logging, sqlite3, sys, time
+from pathlib import Path
+from rpacore import (Engine, EnvCredentialProvider, SqliteQueue, Step, Transaction,
+                     run_queue_loop)
+
+root, recover = Path(sys.argv[1]), sys.argv[2] == 'True'
+def wait_for(name):
+    deadline = time.monotonic() + 20
+    while not (root / name).exists():
+        if time.monotonic() > deadline:
+            raise TimeoutError('parent did not release claim probe')
+        time.sleep(.02)
+
+events, summaries = [], []
+class Capture(logging.Handler):
+    def emit(self, record):
+        events.append({'event': getattr(record, 'event', ''), 'level': record.levelname})
+        if getattr(record, 'event', '') == 'queue_claim_retry':
+            (root / 'retry').touch()
+            if recover:
+                wait_for('release')
+class Effect(Step):
+    def execute(self, ctx):
+        with (root / 'effect').open('a') as output:
+            output.write('effect\\n')
+
+log = logging.getLogger('claim-probe'); log.setLevel(logging.INFO)
+log.addHandler(Capture()); log.propagate = False
+queue = SqliteQueue({'db_path': str(root / 'queue.db')})
+(root / 'ready').touch()
+wait_for('start')
+error = None
+try:
+    run_queue_loop(queue, Engine(), lambda item: Transaction(item.reference,
+                   steps=[Effect('effect', 1)]), {}, EnvCredentialProvider(),
+                   worker_id='claim-probe', logger=log, on_finish=summaries.append)
+except sqlite3.OperationalError as exc:
+    error = exc.sqlite_errorname
+(root / 'result.json').write_text(json.dumps({
+    'error': error, 'events': events,
+    'summaries': [vars(summary) for summary in summaries],
+}), encoding='utf-8')
+sys.exit(0 if error is None else 7)
+"""
+
+
+@pytest.mark.parametrize("recover", [True, False], ids=["released-lock", "exhausted-lock"])
+def test_runner_claim_contention_with_real_process(tmp_path, recover):
+    queue_path = tmp_path / "queue.db"
+    queue = SqliteQueue({"db_path": str(queue_path)})
+    item = QueueItem(reference="claim-contention", payload={})
+    queue.add(item)
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    process = subprocess.Popen([sys.executable, "-c", _CLAIM_WORKER, str(tmp_path), str(recover)], env=env)
+    try:
+        _wait_ready(process, tmp_path / "ready")
+        with closing(sqlite3.connect(queue_path)) as lock:
+            lock.execute("BEGIN IMMEDIATE")
+            (tmp_path / "start").touch()
+            _wait_ready(process, tmp_path / "retry")
+            if recover:
+                lock.rollback()
+                (tmp_path / "release").touch()
+            assert process.wait(timeout=20) == (0 if recover else 7)
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=10)
+    result = json.loads((tmp_path / "result.json").read_text(encoding="utf-8"))
+    assert result["error"] == (None if recover else "SQLITE_BUSY")
+    summary, = result["summaries"]
+    assert summary["processed"] == summary["completed"] == int(recover)
+    assert all(value == 0 for name, value in summary.items() if name not in {"processed", "completed"})
+    retries = [event for event in result["events"] if event["event"] == "queue_claim_retry"]
+    assert len(retries) == (1 if recover else 2)
+    terminal = [event for event in result["events"] if event["event"].startswith("queue_run_")]
+    assert terminal == [{"event": "queue_run_completed" if recover else "queue_run_aborted",
+                         "level": "INFO" if recover else "ERROR"}]
+    stored = queue.get_item(item.id)
+    assert stored.status is (QueueStatus.SUCCESSFUL if recover else QueueStatus.PENDING)
+    assert stored.retry_count == 0 and stored.transaction_id == ""
+    assert len(queue.list_attempts(item.id)) == int(recover)
+    if recover:
+        assert (tmp_path / "effect").read_text() == "effect\n"
+        assert queue.next_item("other-worker") is None
+    else:
+        assert stored.claim_token == stored.claimed_by == ""
+        assert not (tmp_path / "effect").exists()
 
 
 _WORKER = """
